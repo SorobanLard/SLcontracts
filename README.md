@@ -177,11 +177,18 @@ pub struct Certificate {
 ### `CourseStatus` state machine
 
 ```
-Pending ── approve_course() ──→ Active
-Active  ── pause_course()   ──→ Paused
-Paused  ── unpause_course() ──→ Active
-Active  ── archive_course() ──→ Archived (admin only, permanent)
+Pending ── approve_course()  ──→ Active
+Pending ── reject_course()   ──→ Rejected (terminal)
+Active  ── pause_course() / freeze_instructor() ──→ Paused
+Paused  ── unpause_course()  ──→ Active
+Paused  ── archive_course()  ──→ Archived (both admins, no active enrollments, terminal)
 ```
+
+The full transition tables for `CourseStatus` and the `Enrollment` lifecycle
+(active, completed, certificate issued, refunded, archived to history,
+expired), with every function that triggers each transition, are in
+[STATE_MACHINES.md](STATE_MACHINES.md). The accounting and state invariants
+those transitions must preserve are listed in [INVARIANTS.md](INVARIANTS.md).
 
 ---
 
@@ -437,7 +444,8 @@ stellar contract invoke \
 
 - **Authorization**: Every write function calls `require_auth()` on the relevant party. Instructors cannot approve their own courses. Students cannot issue their own certificates. Only the admin can revoke certificates.
 - **No double enrollment**: The contract checks for an existing enrollment record before processing payment. A student cannot be charged twice for the same course.
-- **Atomic payment split**: Both the platform and instructor transfers happen in the same transaction. There is no intermediate escrow that could be exploited.
+- **Atomic payment split**: The student → contract payment, the contract → treasury platform fee and the instructor earnings credit all happen in the same invocation. If any step fails, including the treasury transfer after the student's payment has landed, the whole invocation reverts: no enrollment, earnings credit or `total_earned` change is kept. This is verified by `test_enroll_rolls_back_when_second_split_transfer_fails`.
+- **Token assumptions**: Approved tokens must be standard, fee-free, non-rebasing SAC-style tokens. Instructor earnings are a plain stroops counter that only matches the contract's real balance under that assumption. Fee-on-transfer tokens are rejected at enrollment, but withdrawals and refunds trust the token to deliver the full amount. See `add_approved_token` and [INVARIANTS.md](INVARIANTS.md).
 - **Certificate immutability**: Revoked certificates are flagged — not deleted. This preserves the audit trail and prevents a revocation from being hidden.
 - **Admin is a single address**: For production, consider using a multi-sig wallet as the admin address to avoid a single point of failure.
 - **Fee validation**: Platform fee percentage is validated to be ≤ 100 at both `init` and `register_course` time.

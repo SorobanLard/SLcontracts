@@ -64,6 +64,16 @@
 //!   Any remainder (from integer truncation) stays with the instructor share.
 //! - The contract does **not** escrow student funds beyond the enrollment transaction;
 //!   post-enrollment refunds require admin-initiated archiving with an explicit refund list.
+//! - The split is all-or-nothing: if any transfer in `enroll` panics (including the
+//!   treasury transfer after the student's payment has already landed), the whole
+//!   invocation reverts, so no Enrollment, earnings credit or `total_earned` change is
+//!   kept. See `test_enroll_rolls_back_when_second_split_transfer_fails`.
+//!
+//! ## Token Assumptions
+//! - Approved tokens must be standard, fee-free, non-rebasing SAC-style tokens.
+//!   `DataKey::InstructorEarnings` is a plain counter. It only matches the contract's
+//!   real token balance if every transfer moves exactly the requested amount and
+//!   balances never change on their own. See `add_approved_token` for details.
 //!
 //! ## What This Contract Does NOT Protect Against
 //! - **Off-chain content access** — the contract cannot enforce that a student actually
@@ -3993,6 +4003,28 @@ impl SorobanLardContract {
     }
 
     /// Admin adds a token contract address to the enrollment whitelist.
+    ///
+    /// # Admin requirement — standard tokens only
+    ///
+    /// Only approve standard, fee-free, non-rebasing SAC-style tokens (e.g.
+    /// the Stellar Asset Contract for USDC). The contract does not, and
+    /// cannot, check this here: the only on-chain token check is the 7-decimal
+    /// check in `register_course` / `validate_enrollment`.
+    ///
+    /// Instructor earnings are a plain stroops counter
+    /// (`DataKey::InstructorEarnings`). It is only correct if every
+    /// `transfer(from, to, amount)` moves exactly `amount` and balances never
+    /// change on their own. With a non-standard token:
+    /// - **Fee-on-transfer**: the inbound payment in `enroll` / `re_enroll` is
+    ///   rejected by the balance-delta check ("token transfer amount
+    ///   mismatch"). Outbound transfers (`withdraw_earnings`, refunds) have no
+    ///   such check, so the recipient would get less than the amount debited.
+    /// - **Rebasing**: the contract's real balance drifts away from
+    ///   `sum(InstructorEarnings)`. A negative rebase leaves the last
+    ///   instructors to withdraw unable to do so.
+    ///
+    /// See INVARIANTS.md (token assumptions) and
+    /// `test_reconciliation_instructor_earnings_match_contract_balance`.
     pub fn add_approved_token(env: Env, admin: Address, token: Address) {
         admin.require_auth();
         Self::require_admin(&env, &admin, "add_approved_token");
