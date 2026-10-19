@@ -130,8 +130,9 @@ pub struct ArbitrationFeeConfig {
     pub fee_per_case: i128,
 }
 
-/// Composite storage key for an arbitration case (caller + course_id).
-/// Used as a direct storage key to avoid exceeding DataKey's 50-variant XDR limit.
+/// Existing composite storage key for an arbitration case (caller + course_id).
+/// It avoids exceeding DataKey's 50-variant XDR limit. This direct-key representation
+/// is retained for storage compatibility; future overflow keys belong in `DataKey2`.
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct ArbitrationCaseKey {
@@ -300,7 +301,8 @@ pub struct Course {
     /// `update_content_hash()`.
     pub content_hash: BytesN<32>,
     /// Optional maximum number of certificates that can be issued for this course.
-    /// When set, enforces a hard limit on certificate issuance to prevent credential dilution.
+    /// When set, enforces a hard limit on certificate issuance to prevent credential
+    /// dilution. `None` leaves issuance uncapped by this field.
     pub max_certificates: Option<u32>,
     /// Number of certificates issued for this course
     pub certificates_issued: u32,
@@ -451,6 +453,8 @@ pub struct InstructorStats {
 // STORAGE KEYS
 // ============================================================
 
+/// Primary storage-key enum. Keep new variants here only while within the
+/// contracttype 50-variant limit; put overflow variants in `DataKey2`.
 #[contracttype]
 pub enum DataKey {
     /// Course record by course ID
@@ -507,8 +511,9 @@ pub enum DataKey {
     InstructorBlocked(Address),
     /// Ordered list of all registered course IDs (on-chain catalog)
     CourseList,
-    /// Archived past `Enrollment` records for a (student, course_id) pair,
-    /// preserved when a completed student re-enrolls via `re_enroll()`.
+    /// Append-only full `Enrollment` records archived by `re_enroll()` and refunds.
+    /// There is no contract cap or pruning operation, so storage grows with each
+    /// archived attempt for a (student, course_id) pair.
     EnrollmentHistory(Address, String),
     /// Aggregate reputation stats for an instructor (total students,
     /// completions, certificates issued) — see `InstructorStats`.
@@ -536,15 +541,17 @@ pub enum DataKey {
     CourseWaitlist(String),
     /// Global registry of all instructor addresses who have registered courses
     InstructorRegistry,
-    /// Archived course records by course ID, stored to enforce cooldown
-    /// period before the same course ID can be re-registered.
+    /// Archived course records by course ID. Archiving moves the record here from
+    /// `Course`; this record is returned by `get_course()` and enforces the
+    /// re-registration cooldown.
     ArchivedCourse(String),
     /// Configurable challenge period (in ledger sequences) after which
     /// a pending certificate revocation becomes permanent.
     RevocationChallengePeriod,
     /// Ordered (append-only) list of certificate IDs issued for a course.
-    /// Populated by `issue_certificate` and consumed by course-wide bulk
-    /// operations such as `bulk_revoke_course_certificates()`.
+    /// `max_certificates: Some(n)` bounds its length to `n`; when the course has no
+    /// configured maximum, the list has no contract-level growth bound. Bulk revocation
+    /// reads the entire list and processes every ID in a single transaction.
     CourseCertificates(String),
     /// Mapping from enrollment_reference (unique ID) to (student, course_id)
     /// Used by issue_certificate to look up enrollments without a caller-supplied course_id.
@@ -572,7 +579,11 @@ pub enum DataKey {
     StudentEnrollmentCount(Address),
 }
 
-/// Overflow keys split out to avoid the #[contracttype] variant-count limit.
+/// Overflow storage-key enum for `DataKey`. This is the standard destination
+/// for all future keys that cannot be added to the primary enum. The existing
+/// `ArbitrationCaseKey` is a direct `(caller, course_id)` key introduced to avoid
+/// the same variant limit; retain it for compatibility, but do not introduce more
+/// direct struct keys. Do not extend `DataKey` beyond its 50-variant XDR limit.
 #[contracttype]
 pub enum DataKey2 {
     /// Threshold price (in stroops) above which a course is "high-value"
@@ -1535,7 +1546,9 @@ impl SorobanLardContract {
     }
 
     /// Admin archives a course permanently.
-    /// Only admin can archive — this is a moderation action.
+    /// Only admin can archive — this is a moderation action. At final archival the
+    /// record is moved from `Course(course_id)` to `ArchivedCourse(course_id)`; the
+    /// archived key is retained beyond the re-registration cooldown.
     ///
     /// Supports partial refunds: if `students_to_refund` is provided, only
     /// those students are refunded. If `active_enrollments` reaches zero
@@ -1683,6 +1696,11 @@ impl SorobanLardContract {
         env.storage()
             .persistent()
             .set(&DataKey::ArchivedCourse(course_id.clone()), &course);
+        env.storage().persistent().extend_ttl(
+            &DataKey::ArchivedCourse(course_id.clone()),
+            Self::PERSISTENT_TTL_THRESHOLD,
+            Self::PERSISTENT_TTL_EXTEND_TO,
+        );
 
         env.storage()
             .persistent()
@@ -4853,15 +4871,20 @@ impl SorobanLardContract {
     // READ-ONLY QUERIES
     // ----------------------------------------------------------
 
-    /// Get a course record by ID.
-    /// Extends the course's persistent storage TTL on every read so that
+    /// Get a course record by ID, including archived records.
+    /// Extends the selected record's persistent storage TTL on every read so
     /// actively queried courses never expire silently due to read-only traffic.
     pub fn get_course(env: Env, course_id: String) -> Option<Course> {
-        let key = DataKey::Course(course_id.clone());
-        // Extend TTL whenever the entry exists, regardless of whether we return
-        // Some or None — the has() check is cheap and the extend is a no-op when
-        // the entry is absent.
-        if env.storage().persistent().has(&key) {
+        let active_key = DataKey::Course(course_id.clone());
+        let archived_key = DataKey::ArchivedCourse(course_id.clone());
+        let key = if env.storage().persistent().has(&active_key) {
+            Some(active_key)
+        } else if env.storage().persistent().has(&archived_key) {
+            Some(archived_key)
+        } else {
+            None
+        };
+        if let Some(key) = key {
             env.storage().persistent().extend_ttl(
                 &key,
                 Self::PERSISTENT_TTL_THRESHOLD,
@@ -4899,9 +4922,10 @@ impl SorobanLardContract {
             .get(&DataKey::Enrollment(student, course_id))
     }
 
-    /// Get the archived enrollment history (past completed attempts) for a
-    /// student/course pair, populated by `re_enroll()`. Access follows the
-    /// same rules as `get_enrollment`.
+    /// Get archived enrollment records for a student/course pair. Entries are
+    /// appended by `re_enroll()` and when an enrollment is archived as refunded;
+    /// each entry retains the full `Enrollment` record. Access follows the same
+    /// rules as `get_enrollment`.
     pub fn get_enrollment_history(
         env: Env,
         caller: Address,
