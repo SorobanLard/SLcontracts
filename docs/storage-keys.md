@@ -89,6 +89,7 @@ by users, courses, enrollments, or certificates must be persistent.
 | `DataKey::CourseFailureCount(String)` | Persistent | Per-course counter; one record per course. |
 | `DataKey::BtcEthToken(Address)` | Instance | Small per-token classification flag, bounded by the token whitelist. |
 | `DataKey::StudentEnrollmentCount(Address)` | Persistent | Per-student lifetime counter. |
+| `InstructorRegisteredKey { instructor }` | Persistent | Standalone key; one flag per instructor recording registry membership, so `register_course` avoids scanning `InstructorRegistry`. |
 | `DataKey2::HighValueCourseThreshold` | Instance | Singleton global config. |
 | `DataKey2::HighValueCourseApproval(String)` | Instance | Short-lived per-course co-signature state (transient governance step). |
 
