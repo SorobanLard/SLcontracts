@@ -11950,3 +11950,180 @@ fn test_withdraw_earnings_with_fee_on_transfer_token_underpays_instructor() {
     assert_eq!(token.balance(&contract_id), 0);
     assert_eq!(token.balance(&instructor), earned - fee);
 }
+
+// ============================================================
+// INSTRUCTOR REGISTRY (#170)
+// ============================================================
+
+#[test]
+fn test_registry_lists_each_instructor_once() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    let other = Address::generate(&env);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "REG-A",
+        100_000_000,
+    );
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "REG-B",
+        100_000_000,
+    );
+    register_and_approve_course(&env, &client, &token_id, &admin, &other, "REG-C", 100_000_000);
+
+    let registry = client.get_all_instructors(&admin);
+    assert_eq!(registry.len(), 2);
+    assert_eq!(registry.get(0).unwrap(), instructor);
+    assert_eq!(registry.get(1).unwrap(), other);
+    assert_eq!(client.get_instructor_count(&admin), 2);
+}
+
+#[test]
+fn test_transferee_is_listed_once_on_first_registration() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    let transferee = Address::generate(&env);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "REG-T1",
+        100_000_000,
+    );
+    client.transfer_course(
+        &instructor,
+        &admin,
+        &String::from_str(&env, "REG-T1"),
+        &transferee,
+    );
+
+    // transfer_course does not list the new owner in the registry, so the
+    // first registration by the transferee must add them, exactly once.
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &transferee,
+        "REG-T2",
+        100_000_000,
+    );
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &transferee,
+        "REG-T3",
+        100_000_000,
+    );
+
+    let registry = client.get_all_instructors(&admin);
+    assert_eq!(registry.len(), 2);
+    assert_eq!(registry.get(0).unwrap(), instructor);
+    assert_eq!(registry.get(1).unwrap(), transferee);
+}
+
+#[test]
+fn test_pre_upgrade_instructor_is_not_relisted_without_lookup_key() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "REG-L1",
+        100_000_000,
+    );
+
+    // Simulate a contract deployed before InstructorRegisteredKey existed.
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .persistent()
+            .remove(&InstructorRegisteredKey {
+                instructor: instructor.clone(),
+            });
+    });
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "REG-L2",
+        100_000_000,
+    );
+
+    let registry = client.get_all_instructors(&admin);
+    assert_eq!(registry.len(), 1);
+    assert_eq!(registry.get(0).unwrap(), instructor);
+}
+
+// ============================================================
+// BATCH ENROLL COST BENCHMARK (#167)
+// ============================================================
+
+/// Records the CPU and memory cost of `batch_enroll` at `MAX_BATCH_SIZE`.
+/// Ignored by default so the normal suite stays fast. Run locally with:
+///
+///   cargo test bench_batch_enroll_at_max_batch_size -- --ignored --nocapture
+///
+/// and copy the printed numbers into `docs/batch-enroll-cost.md`.
+#[test]
+#[ignore]
+fn bench_batch_enroll_at_max_batch_size() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &10_000_000_000_000);
+
+    let batch_size = SorobanLardContract::MAX_BATCH_SIZE;
+    let mut course_ids = soroban_sdk::Vec::new(&env);
+    for i in 0..batch_size {
+        let course_id = format!("BENCH-COURSE-{i}");
+        register_and_approve_course(
+            &env,
+            &client,
+            &token_id,
+            &admin,
+            &instructor,
+            &course_id,
+            100_000_000,
+        );
+        course_ids.push_back(String::from_str(&env, &course_id));
+    }
+
+    // Metering is only read back, so lift the default limits to keep a
+    // large batch from aborting before its cost is recorded.
+    env.cost_estimate().budget().reset_unlimited();
+    client.batch_enroll(&student, &course_ids);
+    let budget = env.cost_estimate().budget();
+
+    let last_course = format!("BENCH-COURSE-{}", batch_size - 1);
+    assert!(client.is_enrolled(&student, &String::from_str(&env, &last_course)));
+
+    std::println!(
+        "batch_enroll({}): cpu_instructions={} memory_bytes={}",
+        batch_size,
+        budget.cpu_instruction_cost(),
+        budget.memory_bytes_cost()
+    );
+}

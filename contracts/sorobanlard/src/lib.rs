@@ -758,6 +758,16 @@ pub enum DataKey2 {
 const _: () = assert!(DataKey::VARIANT_COUNT <= DATA_KEY_VARIANT_LIMIT);
 const _: () = assert!(DataKey2::VARIANT_COUNT <= DATA_KEY_VARIANT_LIMIT);
 
+/// Direct-lookup key recording that an instructor is already listed in
+/// `DataKey::InstructorRegistry`. Lets `register_course` answer "is this
+/// instructor new?" without scanning the registry Vec. Stored as a standalone
+/// key so it does not use up `DataKey`'s 50-variant budget.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct InstructorRegisteredKey {
+    pub instructor: Address,
+}
+
 /// A proposed contract code upgrade awaiting its governance time-lock.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -1122,6 +1132,8 @@ impl SorobanLardContract {
 
         let course_count_key = DataKey::InstructorCourseCount(instructor.clone());
         let current_count: u32 = env.storage().instance().get(&course_count_key).unwrap_or(0);
+        // Used below to recognise instructors who predate `InstructorRegisteredKey`.
+        let had_course_count = env.storage().instance().has(&course_count_key);
 
         if current_count >= max_courses {
             panic!("instructor has reached the maximum number of course registrations");
@@ -1192,17 +1204,15 @@ impl SorobanLardContract {
             categories,
         };
 
+        let course_key = DataKey::Course(course_id.clone());
+        env.storage().persistent().set(&course_key, &course);
+        Self::extend_persistent_ttl(&env, &course_key);
+
+        let instructor_ref_key = DataKey::CourseInstructorRef(course_id.clone());
         env.storage()
             .persistent()
-            .set(&DataKey::Course(course_id.clone()), &course);
-
-        Self::extend_persistent_ttl(&env, &DataKey::Course(course_id.clone()));
-
-        env.storage().persistent().set(
-            &DataKey::CourseInstructorRef(course_id.clone()),
-            &instructor,
-        );
-        Self::extend_persistent_ttl(&env, &DataKey::CourseInstructorRef(course_id.clone()));
+            .set(&instructor_ref_key, &instructor);
+        Self::extend_persistent_ttl(&env, &instructor_ref_key);
 
         // Append to on-chain course catalog
         let mut catalog: Vec<String> = env
@@ -1216,10 +1226,9 @@ impl SorobanLardContract {
             .set(&DataKey::CourseList, &catalog);
         Self::extend_persistent_ttl(&env, &DataKey::CourseList);
 
-        env.storage().instance().set(
-            &DataKey::InstructorCourseCount(instructor.clone()),
-            &(current_count + 1),
-        );
+        env.storage()
+            .instance()
+            .set(&course_count_key, &(current_count + 1));
         env.storage()
             .instance()
             .set(&pending_count_key, &(current_pending_count + 1));
@@ -1237,28 +1246,43 @@ impl SorobanLardContract {
             .set(&instructor_list_key, &instructor_courses);
         Self::extend_persistent_ttl(&env, &instructor_list_key);
 
-        // Add instructor to global registry if first course
-        let mut registry: Vec<Address> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::InstructorRegistry)
-            .unwrap_or_else(|| Vec::new(&env));
-
-        // Check if instructor already exists in registry
-        let mut exists = false;
-        for i in 0..registry.len() {
-            if registry.get(i).unwrap() == instructor {
-                exists = true;
-                break;
-            }
-        }
-
-        if !exists {
-            registry.push_back(instructor.clone());
-            env.storage()
+        // Add the instructor to the global registry on their first course.
+        // Membership is recorded under a direct-lookup key, so repeat
+        // instructors never load the registry Vec and new ones are not
+        // checked by scanning it.
+        let registered_key = InstructorRegisteredKey {
+            instructor: instructor.clone(),
+        };
+        if !env.storage().persistent().has(&registered_key) {
+            let mut registry: Vec<Address> = env
+                .storage()
                 .persistent()
-                .set(&DataKey::InstructorRegistry, &registry);
-            Self::extend_persistent_ttl(&env, &DataKey::InstructorRegistry);
+                .get(&DataKey::InstructorRegistry)
+                .unwrap_or_else(|| Vec::new(&env));
+
+            // An instructor with a course count but no key is either from
+            // before this key existed or was a transferee. Scan the Vec only
+            // for them, so an upgraded contract never lists anyone twice.
+            let mut already_listed = false;
+            if had_course_count {
+                for i in 0..registry.len() {
+                    if registry.get(i).unwrap() == instructor {
+                        already_listed = true;
+                        break;
+                    }
+                }
+            }
+
+            if !already_listed {
+                registry.push_back(instructor.clone());
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::InstructorRegistry, &registry);
+                Self::extend_persistent_ttl(&env, &DataKey::InstructorRegistry);
+            }
+
+            env.storage().persistent().set(&registered_key, &true);
+            Self::extend_persistent_ttl(&env, &registered_key);
         }
 
         env.events().publish(
@@ -1596,22 +1620,22 @@ impl SorobanLardContract {
             }
         }
 
-        let previous_instructor = course.instructor.clone();
+        // Swap in the new owner and keep the previous one, so no clone is needed.
+        let previous_instructor =
+            core::mem::replace(&mut course.instructor, new_instructor.clone());
 
-        course.instructor = new_instructor.clone();
         course.last_updated_ledger = env.ledger().sequence();
-        env.storage()
-            .persistent()
-            .set(&DataKey::Course(course_id.clone()), &course);
-        Self::extend_persistent_ttl(&env, &DataKey::Course(course_id.clone()));
+        let course_key = DataKey::Course(course_id.clone());
+        env.storage().persistent().set(&course_key, &course);
+        Self::extend_persistent_ttl(&env, &course_key);
 
         // Keep CourseInstructorRef in sync so enroll() continues to succeed
         // after ownership changes. Enrollment records themselves are untouched.
-        env.storage().persistent().set(
-            &DataKey::CourseInstructorRef(course_id.clone()),
-            &new_instructor,
-        );
-        Self::extend_persistent_ttl(&env, &DataKey::CourseInstructorRef(course_id.clone()));
+        let instructor_ref_key = DataKey::CourseInstructorRef(course_id.clone());
+        env.storage()
+            .persistent()
+            .set(&instructor_ref_key, &new_instructor);
+        Self::extend_persistent_ttl(&env, &instructor_ref_key);
 
         let old_count_key = DataKey::InstructorCourseCount(previous_instructor.clone());
         let old_count: u32 = env.storage().instance().get(&old_count_key).unwrap_or(0);
