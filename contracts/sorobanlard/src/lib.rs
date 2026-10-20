@@ -615,6 +615,128 @@ macro_rules! contract_data_key {
     };
 }
 
+contract_data_key! {
+    pub enum DataKey {
+        /// Course record by course ID
+        Course(String),
+        /// Immutable instructor address recorded at registration time
+        CourseInstructorRef(String),
+        /// Enrollment record by (student_address, course_id)
+        Enrollment(Address, String),
+        /// Certificate record by certificate ID
+        Certificate(String),
+        /// Admin address — set at init, can approve courses and issue certificates
+        Admin,
+        /// Secondary admin address for multi-sig operations
+        SecondaryAdmin,
+        /// Optional ledger sequence when the admin role expires
+        AdminExpiresAt,
+        /// Platform treasury address — receives the platform fee share
+        Treasury,
+        /// Platform default fee percentage (overrideable per course)
+        DefaultFee,
+        /// Pending platform treasury address and effective ledger sequence
+        PendingTreasury,
+        /// Whitelisted token contract address (used to validate course tokens)
+        ApprovedToken(Address),
+        /// Pending new admin address — must call accept_admin() to take effect
+        PendingAdmin,
+        /// Pending new secondary admin address
+        PendingSecondaryAdmin,
+        /// Platform paused state flag
+        PlatformPaused,
+        /// Accumulated instructor earnings per (instructor, token) pair (in stroops)
+        InstructorEarnings(Address, Address),
+        /// Accumulated instructor earnings across all tokens (in stroops)
+        InstructorTotalEarnings(Address),
+        /// Number of courses registered by an instructor
+        InstructorCourseCount(Address),
+        /// Number of currently pending courses for an instructor
+        InstructorPendingCourseCount(Address),
+        /// Ordered list of course IDs registered by a specific instructor
+        /// (append-only — course status changes never remove an entry).
+        InstructorCourseList(Address),
+        /// Maximum number of courses an instructor can register
+        MaxCoursesPerInstructor,
+        /// Minimum ledger sequences required between course registration and approval
+        MinReviewDelay,
+        /// Default minimum ledger sequences required between enroll() and
+        /// mark_completed() for newly-registered courses (admin-configurable).
+        DefaultMinCompletionLedgers,
+        /// Refund window delay in ledger sequences
+        RefundWindow,
+        /// Refund request record by (student_address, course_id)
+        RefundRequest(Address, String),
+        /// Blocklist of instructor addresses who are frozen
+        InstructorBlocked(Address),
+        /// Ordered list of all registered course IDs (on-chain catalog)
+        CourseList,
+        /// Archived past `Enrollment` records for a (student, course_id) pair,
+        /// preserved when a completed student re-enrolls via `re_enroll()`.
+        EnrollmentHistory(Address, String),
+        /// Aggregate reputation stats for an instructor (total students,
+        /// completions, certificates issued) — see `InstructorStats`.
+        InstructorStats(Address),
+        /// Blocklist of student addresses who are banned from the platform
+        StudentBlocked(Address),
+        /// Per-token fee configuration (maps token address → FeeConfig)
+        FeeConfig(Address),
+        /// Arbitration fee configuration
+        ArbitrationFeeConfig,
+        /// Risk fee configuration for surcharge pricing
+        RiskFeeConfig,
+        /// Flag indicating whether risk-based fee pricing is enabled
+        RiskConfigEnabled,
+        /// Total active enrollments across all courses platform-wide
+        TotalActiveEnrollments,
+        /// Maximum total active enrollments allowed platform-wide
+        PlatformEnrollmentCap,
+        /// A proposed contract Wasm upgrade awaiting its time-lock, if any.
+        PendingUpgrade,
+        /// Configurable time-lock (in ledger sequences) that must elapse
+        /// between an upgrade proposal and its execution.
+        UpgradeTimelock,
+        /// Waitlist for a course - ordered list of student addresses waiting for enrollment
+        CourseWaitlist(String),
+        /// Global registry of all instructor addresses who have registered courses
+        InstructorRegistry,
+        /// Archived course records by course ID, stored to enforce cooldown
+        /// period before the same course ID can be re-registered.
+        ArchivedCourse(String),
+        /// Configurable challenge period (in ledger sequences) after which
+        /// a pending certificate revocation becomes permanent.
+        RevocationChallengePeriod,
+        /// Ordered (append-only) list of certificate IDs issued for a course.
+        /// Populated by `issue_certificate` and consumed by course-wide bulk
+        /// operations such as `bulk_revoke_course_certificates()`.
+        CourseCertificates(String),
+        /// Mapping from enrollment_reference (unique ID) to (student, course_id)
+        /// Used by issue_certificate to look up enrollments without a caller-supplied course_id.
+        EnrollmentByRef(String),
+        /// Counter for generating unique enrollment references
+        EnrollmentRefCounter,
+        /// Global registry of approver addresses with course approval authority
+        Approver(Address),
+        /// Ledger sequence when init() was called — used to enforce
+        /// a governance window before approve_course() can be called.
+        InitLedger,
+        /// Ledger sequence of the last successful transfer_admin() call.
+        /// Used to enforce a minimum cooldown between consecutive admin key
+        /// rotations, preventing rapid-rotation attacks after a compromise.
+        LastAdminTransferLedger,
+        /// Per-course consecutive enrollment failure counter.
+        /// Incremented each time enroll_internal() panics due to a token
+        /// transfer failure for a specific course. Reset to 0 on a successful
+        /// enrollment. When the count reaches CIRCUIT_BREAKER_THRESHOLD the
+        /// course is automatically paused.
+        CourseFailureCount(String),
+        /// Tokens classified as BTC/ETH-denominated for risk-surcharge pricing.
+        BtcEthToken(Address),
+        /// Lifetime enrollment count per student (new-customer risk flag).
+        StudentEnrollmentCount(Address),
+    }
+}
+
 /// Overflow keys split out to avoid the #[contracttype] variant-count limit.
 #[contracttype]
 pub enum DataKey2 {
