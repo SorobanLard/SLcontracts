@@ -2146,10 +2146,12 @@ impl SorobanLardContract {
             seen.set(id, true);
         }
 
-        // Validate every course before any mutation
+        // Validate every course before any mutation. Each validated Course
+        // is kept so the enroll pass below does not read it from storage again.
+        let mut validated: Vec<Course> = Vec::new(&env);
         for i in 0..course_ids.len() {
             let course_id = course_ids.get(i).unwrap();
-            Self::validate_enrollment(&env, &student, &course_id);
+            validated.push_back(Self::validate_enrollment(&env, &student, &course_id));
         }
 
         // All validations passed — enroll atomically using the validated
@@ -2157,11 +2159,14 @@ impl SorobanLardContract {
         // enroll_internal().
         for i in 0..course_ids.len() {
             let course_id = course_ids.get(i).unwrap();
-            Self::enroll_internal_validated(&env, &student, &course_id);
+            let course = validated.get(i).unwrap();
+            Self::enroll_internal_validated(&env, &student, &course_id, course);
         }
     }
 
-    fn validate_enrollment(env: &Env, student: &Address, course_id: &String) {
+    /// Run every enrollment guard for `student` in `course_id` and return the
+    /// Course that was checked, so callers can reuse it without another read.
+    fn validate_enrollment(env: &Env, student: &Address, course_id: &String) -> Course {
         if env
             .storage()
             .instance()
@@ -2312,13 +2317,12 @@ impl SorobanLardContract {
                 panic!("platform has reached maximum total enrollment capacity");
             }
         }
+
+        course
     }
 
     fn enroll_internal(env: &Env, student: &Address, course_id: &String) {
-        Self::validate_enrollment(env, student, course_id);
-
-        let mut course =
-            Self::get_course_internal(env, course_id).unwrap_or_else(|| panic!("course not found"));
+        let mut course = Self::validate_enrollment(env, student, course_id);
         let token_client = token::Client::new(env, &course.token);
 
         // #178 — Circuit breaker early-exit: if a prior failed invocation has already
@@ -2618,11 +2622,15 @@ impl SorobanLardContract {
     /// # Safety
     ///
     /// Callers must ensure `validate_enrollment()` was already called for
-    /// this `(student, course_id)` pair in the same transaction. Direct
-    /// external callers must use `enroll_internal()` instead.
-    fn enroll_internal_validated(env: &Env, student: &Address, course_id: &String) {
-        let mut course =
-            Self::get_course_internal(env, course_id).unwrap_or_else(|| panic!("course not found"));
+    /// this `(student, course_id)` pair in the same transaction, and pass in
+    /// the Course it returned. Direct external callers must use
+    /// `enroll_internal()` instead.
+    fn enroll_internal_validated(
+        env: &Env,
+        student: &Address,
+        course_id: &String,
+        mut course: Course,
+    ) {
         let token_client = token::Client::new(env, &course.token);
 
         if course.status != CourseStatus::Active {
@@ -5227,6 +5235,11 @@ impl SorobanLardContract {
     /// Bump the TTL of a persistent entry using the contract-wide policy.
     /// Every persistent TTL extension goes through here, so changing the
     /// policy (or making it per key category) is a one-place edit.
+    ///
+    /// The host only writes a new TTL when the entry is below
+    /// `PERSISTENT_TTL_THRESHOLD`, so a call on an entry that is still
+    /// healthy does not change its expiry. SDK 22 has no getter for the
+    /// remaining TTL, so the check cannot be made in the contract itself.
     fn extend_persistent_ttl<K>(env: &Env, key: &K)
     where
         K: IntoVal<Env, Val>,
@@ -5966,11 +5979,7 @@ impl SorobanLardContract {
 
         case.status = DisputeStatus::AutoRefunded;
         env.storage().persistent().set(&case_key, &case);
-        env.storage().persistent().extend_ttl(
-            &case_key,
-            Self::PERSISTENT_TTL_THRESHOLD,
-            Self::PERSISTENT_TTL_EXTEND_TO,
-        );
+        Self::extend_persistent_ttl(&env, &case_key);
 
         let outcome_topic = match case.status {
             DisputeStatus::ResolvedForStudent => Symbol::new(&env, "resolved_for_student"),
