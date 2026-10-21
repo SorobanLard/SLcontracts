@@ -7,7 +7,8 @@ description = "SorobanLard — On-chain course enrollment, payments, and certifi
 authors = ["SorobanLard Team"]
 
 [lib]
-crate-type = ["cdylib"]
+# rlib lets the fuzz/ crate import the contract types; the wasm build is still cdylib.
+crate-type = ["cdylib", "rlib"]
 doctest = false
 
 [dependencies]
