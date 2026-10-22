@@ -210,18 +210,18 @@ those transitions must preserve are listed in [INVARIANTS.md](INVARIANTS.md).
 
 ## Contract Functions
 
-### `init(admin, treasury, default_fee_pct)`
-Initialises the contract. Called once by the deployer.
+### `init(admin, secondary_admin, treasury, default_fee_pct, max_courses_per_instructor, refund_window_ledgers, revocation_challenge_period)`
+Initialises the contract. Called once by the deployer, immediately after deployment. Every argument has operational consequences; see [Initialize after deployment](#initialize-after-deployment) for recommended values and the decisions to make first.
 
 ### Course management
 
 | Function | Caller | Description |
 |---|---|---|
-| `register_course(instructor, course_id, price, token, platform_fee_pct)` | Instructor | Register a course — starts as Pending |
+| `register_course(instructor, course_id, price, token, platform_fee_pct, max_capacity, content_hash, categories)` | Instructor | Register a course — starts as Pending. `price` is in stroops (0 for free); `max_capacity` is optional; `content_hash` is 32 bytes. |
 | `approve_course(admin, course_id)` | Admin | Move Pending → Active |
 | `pause_course(caller, course_id)` | Admin or Instructor | Move Active → Paused |
 | `unpause_course(caller, course_id)` | Admin or Instructor | Move Paused → Active |
-| `archive_course(admin, course_id)` | Admin only | Permanently archive |
+| `archive_course(admin1, admin2, course_id, students_to_refund)` | Both admins | Permanently archive. `students_to_refund` is optional. |
 
 ### Enrollment
 
@@ -235,18 +235,15 @@ Initialises the contract. Called once by the deployer.
 |---|---|---|
 | `mark_completed(admin, student, course_id, evidence_hash)` | Admin | Called after backend verifies all lessons done. A non-empty `evidence_hash` replaces the student co-signature. |
 | `issue_certificate(admin, student, course_id, cert_id, course_title, enrollment_reference, expires_at_ledger, instructor_signature)` | Admin | Issues on-chain certificate. Requires completion. `enrollment_reference` is a free-form backend ID (e.g. UUID). |
-| `revoke_certificate(admin, cert_id)` | Admin | Flags certificate as revoked |
-| `mark_completed(admin, student, course_id)` | Admin | Called after backend verifies all lessons done |
-| `issue_certificate(admin, cert_id, student, course_id, course_title)` | Admin | Issues on-chain certificate. Requires completion. |
-| `revoke_certificate(admin, cert_id, reason)` | Admin | Flags certificate as revoked |
+| `revoke_certificate(admin, certificate_id, reason)` | Admin | Flags certificate as revoked |
 | `bulk_revoke_course_certificates(admin, course_id)` | Admin | Flags every certificate of a course as revoked in one transaction |
 
 ### Admin management
 
 | Function | Caller | Description |
 |---|---|---|
-| `transfer_admin(current_admin, new_admin)` | Admin | Transfer admin role |
-| `update_treasury(admin, new_treasury)` | Admin | Update treasury address |
+| `transfer_admin(admin1, admin2, new_admin, new_secondary_admin)` | Both admins | Transfer admin role |
+| `update_treasury(admin1, admin2, new_treasury)` | Both admins | Update treasury address |
 | `update_default_fee(admin, new_fee_pct)` | Admin | Update default platform fee |
 
 ### Read-only queries
@@ -254,12 +251,12 @@ Initialises the contract. Called once by the deployer.
 | Function | Returns |
 |---|---|---|
 | `get_course(course_id)` | Full `Course` struct |
-| `get_enrollment(student, course_id)` | Full `Enrollment` struct |
+| `get_enrollment(caller, student, course_id)` | Full `Enrollment` struct (student or admin only) |
 | `get_certificate(caller, certificate_id)` | Full `Certificate` struct (student, instructor, or admin only) |
 | `is_enrolled(student, course_id)` | `bool` |
 | `has_completed(student, course_id)` | `bool` |
 | `verify_certificate(certificate_id)` | `bool` — true if exists and not revoked |
-| `get_platform_fee()` | `u32` — current default fee % |
+| `get_platform_fee(admin)` | `u32` — current default fee % (admin only) |
 
 ---
 
@@ -328,8 +325,13 @@ The backend listens to these events and updates the database, sends notification
 sorobanlard-contract/
 ├── Cargo.toml                         ← Rust workspace config
 ├── Cargo.lock
+├── .cargo/
+│   └── audit.toml                     ← cargo-audit advisory policy
 ├── .gitignore
 ├── README.md
+├── scripts/
+│   ├── check_readme_api.py            ← README vs lib.rs signature check
+│   └── smoke-test-testnet.sh          ← Post-deployment testnet smoke test
 └── contracts/
     └── sorobanlard/
         ├── Cargo.toml                 ← Contract package config
@@ -419,6 +421,8 @@ make deploy-testnet
 
 ### Initialize after deployment
 
+`init` takes seven arguments. It can be called once; a second call panics with `contract already initialized`.
+
 ```bash
 stellar contract invoke \
   --id <CONTRACT_ID> \
@@ -426,9 +430,48 @@ stellar contract invoke \
   --network testnet \
   -- init \
   --admin <ADMIN_ADDRESS> \
+  --secondary_admin <SECONDARY_ADMIN_ADDRESS> \
   --treasury <TREASURY_ADDRESS> \
-  --default_fee_pct 20
+  --default_fee_pct 20 \
+  --max_courses_per_instructor 50 \
+  --refund_window_ledgers 17280 \
+  --revocation_challenge_period 17280
 ```
+
+| Argument | Recommended value | Rationale |
+|---|---|---|
+| `admin` | A dedicated admin key (ideally a multi-sig account) | Approves courses, issues certificates, and governs every admin function. |
+| `secondary_admin` | A separate key held by a different person | Co-signs sensitive operations such as `transfer_admin`, `update_treasury`, and upgrades. Must differ from `admin` and `treasury`. |
+| `treasury` | A cold or multi-sig account that receives the platform fee | Must differ from `admin`, `secondary_admin`, and the contract address. |
+| `default_fee_pct` | `20` | Platform fee in percent (0–100), used when a course does not override it. The same value as the examples elsewhere in this README. |
+| `max_courses_per_instructor` | `50` | Caps how many courses one instructor can register. Can be raised later with `update_max_courses_limit`. |
+| `refund_window_ledgers` | `17280` (about 1 day at 5 s per ledger) | Students can request a refund only within this many ledgers after enrolling. Use `120960` (about 7 days) for a more generous policy. |
+| `revocation_challenge_period` | `17280` (about 1 day) | How long a student can challenge a certificate revocation before it becomes permanent. |
+
+#### Decisions to make before calling `init`
+
+- [ ] **Who holds `secondary_admin`'s key?** It should be a different person or device from `admin`, or the two-admin control is lost.
+- [ ] **Is `admin` a multi-sig account?** A single key is a single point of failure for every admin operation.
+- [ ] **Which treasury account receives fees?** Confirm it can receive every approved token before going live.
+- [ ] **What refund window fits the course policy?** Pick a value and record it; it is set at init and changed later with `update_refund_window`.
+- [ ] **What certificate challenge period is acceptable?** Shorter periods make revocations final sooner; longer periods give students more time to contest them.
+- [ ] **Which tokens will be approved?** `init` does not approve any token. Call `add_approved_token` afterwards, and only for SAC tokens with 7 decimals.
+- [ ] **Is the governance window set?** `approve_course` is blocked until `update_min_review_delay` ledgers have passed since init. The default is `0` (no window), so set it explicitly if you want one.
+- [ ] **Are the addresses correct for this network?** Double-check every address against the target network before submitting; a wrong treasury address cannot be changed without an admin transaction.
+
+### Smoke test after deployment
+
+Run the smoke test once after `init` to confirm the deployment behaves end to end before handing the contract ID to the backend or frontend teams. It runs register → approve → enroll → mark complete → issue certificate → verify against a free course, so no token funds are moved.
+
+```bash
+export CONTRACT_ID=<CONTRACT_ID>
+export ADMIN_ACCOUNT=my-account
+export INSTRUCTOR_ACCOUNT=instructor-account
+export STUDENT_ACCOUNT=student-account
+./scripts/smoke-test-testnet.sh
+```
+
+Exit codes: `0` if every step succeeded and `verify_certificate` returned `true`; `1` on a missing environment variable or missing `stellar` CLI; `2` if any contract call failed (the failing step is printed).
 
 ### Register and approve a test course
 

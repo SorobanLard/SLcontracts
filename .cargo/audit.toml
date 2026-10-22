@@ -1,0 +1,11 @@
+# cargo-audit policy for the RustSec advisory check run in CI.
+#
+# Every entry in `ignore` must carry a comment with the reason it is accepted,
+# the component it affects, and when it should be re-reviewed. See the
+# "Dependency advisories" section of CONTRIBUTING.md for the full policy.
+#
+# Currently no advisories are ignored: `cargo audit` fails the build on any
+# vulnerability in Cargo.lock.
+
+[advisories]
+ignore = []
