@@ -1,0 +1,203 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+      - name: Run unit tests (excluding property-based suite)
+        run: cargo test --workspace -- --skip proptests
+        env:
+          RUST_BACKTRACE: 1
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+
+  fmt:
+    name: Format Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+      - run: cargo fmt --all -- --check
+
+  datakey-variant-limit:
+    name: DataKey Variant Limit Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Warn when DataKey / DataKey2 approach the 50-variant limit
+        run: |
+          LIMIT=50
+          WARN_THRESHOLD=45
+          status=0
+          for enum in DataKey DataKey2; do
+            count=$(awk "/pub enum $enum[[:space:]]*\\{/{flag=1;next} flag&&/^[[:space:]]*\\}/{flag=0} flag" contracts/sorobanlard/src/lib.rs \
+              | grep -E '^[[:space:]]*[A-Z][A-Za-z0-9_]*' \
+              | grep -vE '^[[:space:]]*//' \
+              | wc -l | tr -d ' ')
+            echo "$enum: $count variants (limit $LIMIT, warn at $WARN_THRESHOLD)"
+            if [ "$count" -gt "$LIMIT" ]; then
+              echo "::error::$enum has $count variants, exceeding the $LIMIT-variant #[contracttype] limit."
+              status=1
+            elif [ "$count" -ge "$WARN_THRESHOLD" ]; then
+              echo "::warning::$enum has $count variants, approaching the $LIMIT-variant #[contracttype] limit. Plan the next overflow enum before adding more keys."
+            fi
+          done
+          exit $status
+
+  docs-lint:
+    name: Docs Lint (architecture diagram)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify README architecture diagram covers all subsystems
+        run: |
+          set -euo pipefail
+          if [ ! -f README.md ]; then
+            echo "ERROR: README.md not found"
+            exit 1
+          fi
+          if ! grep -q 'Architecture' README.md; then
+            echo "ERROR: README.md is missing an Architecture section"
+            exit 1
+          fi
+          missing=0
+          for subsystem in "Course Registry" "Enrollment" "Payment" "Certificate" "Arbitration" "Waitlist" "Fee"; do
+            if ! grep -qi "$subsystem" README.md; then
+              echo "ERROR: README architecture diagram is missing subsystem: $subsystem"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "Update the architecture diagram in README.md to include all subsystems."
+            exit 1
+          fi
+          echo "README architecture diagram references all required subsystems."
+
+  panic-message-style:
+    name: Panic Message Style
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check panic message style
+        run: |
+          status=0
+          while IFS= read -r line; do
+            file="${line%%:*}"
+            rest="${line#*:}"
+            lineno="${rest%%:*}"
+            msg="${rest#*:}"
+            literal=$(printf '%s' "$msg" | sed -n 's/.*"\(.*\)".*/\1/p')
+            [ -z "$literal" ] && continue
+            if printf '%s' "$literal" | grep -q '\.$'; then
+              echo "$file:$lineno: panic message must not end with a period: $literal"
+              status=1
+            fi
+            if printf '%s' "$literal" | grep -q '^[A-Z]'; then
+              echo "$file:$lineno: panic message must start lowercase: $literal"
+              status=1
+            fi
+          done < <(grep -rnE 'panic!\(' --include='lib.rs' contracts/sorobanlard/src)
+          exit $status
+
+  coverage:
+    name: Code Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+      - name: Install cargo-llvm-cov
+        run: cargo install cargo-llvm-cov
+      - name: Generate coverage
+        run: cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: ./lcov.info
+          fail_ci_if_error: false
+
+  wasm-build:
+    name: WASM Build (wasm32-unknown-unknown)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+      - name: Install wasm32 target
+        run: rustup target add wasm32-unknown-unknown
+      - name: Build WASM contracts
+        run: make build
+      - name: Check optimized WASM size
+        run: |
+          for wasm in target/wasm32-unknown-unknown/release/*.wasm; do
+            size=$(stat -f%z "$wasm" 2>/dev/null || stat -c%s "$wasm" 2>/dev/null)
+            name=$(basename "$wasm")
+            echo "$name: $size bytes"
+            if [ "$size" -gt 262144 ]; then
+              echo "ERROR: $name exceeds 256 KiB limit"
+              exit 1
+            fi
+          done
+
+  audit:
+    name: Dependency Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      # Reads Cargo.lock and .cargo/audit.toml. Policy for advisories with no fix
+      # is documented in CONTRIBUTING.md.
+      - name: Audit Cargo.lock against RustSec
+        run: cargo audit
+
+  readme-api:
+    name: README API Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check README references match lib.rs signatures
+        run: python3 scripts/check_readme_api.py
+
+  property-tests:
+    name: Property-based tests (accounting fuzzing)
+    runs-on: ubuntu-latest
+    env:
+      PROPTEST_CASES: 256
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run property-based accounting tests
+        run: cargo test --workspace proptests
