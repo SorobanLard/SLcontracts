@@ -3826,8 +3826,7 @@ fn test_get_enrollment_unauthorized_access() {
 // ============================================================
 
 #[test]
-#[should_panic(expected = "course ID is within archival cooldown period")]
-fn test_archive_then_reregister_fails() {
+fn test_archive_moves_record_and_get_course_returns_archive_during_cooldown() {
     let (env, contract_id, token_id, admin, sec_admin, _treasury, instructor) = setup();
     let client = SorobanLardContractClient::new(&env, &contract_id);
 
@@ -3845,11 +3844,27 @@ fn test_archive_then_reregister_fails() {
     client.pause_course(&admin, &course_id);
     client.archive_course(&admin, &sec_admin, &course_id, &None);
 
+    let (active_record_exists, archived_record_exists) = env.as_contract(&contract_id, || {
+        (
+            env.storage()
+                .persistent()
+                .has(&DataKey::Course(course_id.clone())),
+            env.storage()
+                .persistent()
+                .has(&DataKey::ArchivedCourse(course_id.clone())),
+        )
+    });
+    assert!(!active_record_exists);
+    assert!(archived_record_exists);
+
     let course = client.get_course(&course_id).unwrap();
     assert_eq!(course.status, CourseStatus::Archived);
+    assert!(course.archived_at_ledger.is_some());
 
-    // Try to register the same course again
-    client.register_course(
+    // `get_course()` continues to return the archived record during the
+    // cooldown, rather than exposing a stale active record or returning None.
+    let archived_at = course.archived_at_ledger.unwrap();
+    let reregister = client.try_register_course(
         &instructor,
         &course_id,
         &100_000_000,
@@ -3858,6 +3873,19 @@ fn test_archive_then_reregister_fails() {
         &None,
         &BytesN::from_array(&env, &[1u8; 32]),
         &soroban_sdk::Vec::new(&env),
+    );
+    assert!(reregister.is_err(), "archived course ID must remain reserved");
+
+    env.ledger().with_mut(|l| {
+        l.sequence_number = archived_at + SorobanLardContract::ARCHIVE_COOLDOWN_LEDGERS - 1;
+    });
+    let course_during_cooldown = client.get_course(&course_id).unwrap();
+    assert_eq!(course_during_cooldown.id, course_id);
+    assert_eq!(course_during_cooldown.instructor, instructor);
+    assert_eq!(course_during_cooldown.status, CourseStatus::Archived);
+    assert_eq!(
+        course_during_cooldown.archived_at_ledger,
+        Some(archived_at)
     );
 }
 
@@ -9932,6 +9960,67 @@ fn test_bulk_revoke_course_certificates_revokes_five_certificates() {
     for i in 0..indexed.len() {
         assert!(!client.verify_certificate(&indexed.get(i).unwrap()));
     }
+}
+
+#[test]
+fn benchmark_bulk_revoke_course_certificates_100_items() {
+    const CERTIFICATE_COUNT: u32 = 100;
+
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    let course_id = String::from_str(&env, "COURSE-BULK-BENCHMARK");
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-BULK-BENCHMARK",
+        100_000_000,
+    );
+
+    env.as_contract(&contract_id, || {
+        let mut certificate_ids = soroban_sdk::Vec::new(&env);
+        for index in 0..CERTIFICATE_COUNT {
+            let certificate_id = String::from_str(&env, &format!("CERT-BULK-BENCHMARK-{index}"));
+            let certificate = Certificate {
+                id: certificate_id.clone(),
+                student: Address::generate(&env),
+                course_id: course_id.clone(),
+                course_title: String::from_str(&env, "Bulk revocation benchmark"),
+                enrollment_reference: String::from_str(&env, "benchmark-enrollment"),
+                instructor: instructor.clone(),
+                issued_by: contract_id.clone(),
+                issued_at_ledger: env.ledger().sequence(),
+                revoked: false,
+                revoked_by: None,
+                revocation_ledger: None,
+                revocation_reason: None,
+                expires_at_ledger: None,
+                instructor_signature: None,
+                revocation_deadline: None,
+            };
+            env.storage()
+                .persistent()
+                .set(&DataKey::Certificate(certificate_id.clone()), &certificate);
+            certificate_ids.push_back(certificate_id);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::CourseCertificates(course_id.clone()), &certificate_ids);
+    });
+
+    let cpu_before = env.cost_estimate().budget().cpu_instruction_cost();
+    let memory_before = env.cost_estimate().budget().memory_bytes_cost();
+    let revoked_count = client.bulk_revoke_course_certificates(&admin, &course_id);
+    let cpu_cost = env.cost_estimate().budget().cpu_instruction_cost() - cpu_before;
+    let memory_cost = env.cost_estimate().budget().memory_bytes_cost() - memory_before;
+
+    assert_eq!(revoked_count, CERTIFICATE_COUNT);
+    assert!(cpu_cost > 0);
+    std::println!(
+        "bulk revoke benchmark ({CERTIFICATE_COUNT} certificates): {cpu_cost} CPU instructions, {memory_cost} memory bytes"
+    );
 }
 
 #[test]

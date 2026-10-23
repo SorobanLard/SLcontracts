@@ -215,6 +215,54 @@ expired), with every function that triggers each transition, are in
 [STATE_MACHINES.md](STATE_MACHINES.md). The accounting and state invariants
 those transitions must preserve are listed in [INVARIANTS.md](INVARIANTS.md).
 
+### Lifecycle and storage growth
+
+Archiving is a move, not a duplicate: once all active enrollments are cleared,
+`archive_course()` writes the final record to `ArchivedCourse(course_id)` and
+removes `Course(course_id)` in the same transaction. The archived record has
+`status = Archived` and an `archived_at_ledger` timestamp. `get_course()` checks
+the active key first and then the archived key, so it continues returning the
+archived record (`Some(Course)`) during the full 172,800-ledger cooldown (about
+10 days). The archived key's TTL is extended when written and when read. The
+`CourseList` catalog is not pruned by archival. As with other persistent
+records, an archived entry can expire after prolonged inactivity once its TTL
+is no longer renewed; the guaranteed cooldown is shorter than the write-time
+TTL extension.
+
+`CourseCertificates(course_id)` is an append-only index. Setting
+`max_certificates` to `Some(n)` caps issuance and the index at `n`; with
+`max_certificates = None`, there is no contract-level cap. The test
+`benchmark_bulk_revoke_course_certificates_100_items` measures CPU and memory
+cost for revoking 100 indexed certificates. Run it with:
+
+```sh
+cargo test -p sorobanlard benchmark_bulk_revoke_course_certificates_100_items -- --nocapture
+```
+
+This test-host measurement is a baseline, not a production WASM fee quote.
+Bulk revocation currently loads the full index and processes it in one
+transaction, so cost grows linearly and an arbitrarily large uncapped course
+can exceed transaction limits. The chosen policy is not to impose a new
+implicit issuance cap; use `max_certificates` when a course needs an enforced
+ceiling. Truly large uncapped courses need a paginated revocation API and an
+index representation that does not load the full list per page.
+
+`EnrollmentHistory(student, course_id)` is also append-only and has no
+contract-level cap or pruning function. Each `re_enroll()` archives the full
+previous `Enrollment` (all fields) before writing the new attempt; refund
+processing also appends a refunded enrollment. This favors complete audit
+history over a smaller summary, but storage grows with each retake/refund.
+History TTL is refreshed on writes, not reads, so the stored history can expire
+after inactivity; there is no contract operation to prune selected attempts.
+
+### Storage key layout
+
+`DataKey` is the primary key enum and is limited to 50 contracttype variants.
+`DataKey2` is the standard destination for all future overflow keys. The
+existing `ArbitrationCaseKey` is a direct composite storage key retained to
+avoid the variant limit; it is a compatibility exception, not a pattern for
+additional direct struct keys.
+
 ---
 
 ## Contract Functions
