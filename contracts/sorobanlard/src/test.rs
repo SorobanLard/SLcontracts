@@ -4680,7 +4680,9 @@ fn test_events_emitted_for_admin_operations() {
     assert_eq!(event_fee, 25u32);
 
     // add_approved_token / remove_approved_token
-    let other_token = Address::generate(&env);
+    let other_token = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
     client.add_approved_token(&admin, &other_token);
     let (event_admin, event_token): (Address, Address) =
         last_event_val(&env, &contract_id, "token_whitelisted")
@@ -13561,3 +13563,346 @@ fn test_cancel_upgrade_requires_auth_from_both_admins() {
 }
 
 mod proptests;
+
+// ============================================================
+// TOKEN INTERFACE VALIDATION ON APPROVAL
+// ============================================================
+
+mod not_a_token {
+    use super::*;
+
+    #[contract]
+    pub struct NotATokenContract;
+
+    #[contractimpl]
+    impl NotATokenContract {
+        pub fn ping(_env: Env) {}
+    }
+}
+
+mod wrong_decimals_token {
+    use super::*;
+
+    #[contract]
+    pub struct WrongDecimalsToken;
+
+    #[contractimpl]
+    impl WrongDecimalsToken {
+        pub fn decimals(_env: Env) -> u32 {
+            18
+        }
+
+        pub fn balance(_env: Env, _id: Address) -> i128 {
+            0
+        }
+    }
+}
+
+mod broken_balance_token {
+    use super::*;
+
+    #[contract]
+    pub struct BrokenBalanceToken;
+
+    #[contractimpl]
+    impl BrokenBalanceToken {
+        pub fn decimals(_env: Env) -> u32 {
+            7
+        }
+
+        pub fn balance(_env: Env, _id: Address) -> i128 {
+            panic!("balance not implemented")
+        }
+    }
+}
+
+mod negative_balance_token {
+    use super::*;
+
+    #[contract]
+    pub struct NegativeBalanceToken;
+
+    #[contractimpl]
+    impl NegativeBalanceToken {
+        pub fn decimals(_env: Env) -> u32 {
+            7
+        }
+
+        pub fn balance(_env: Env, _id: Address) -> i128 {
+            -1
+        }
+    }
+}
+
+#[test]
+fn test_add_approved_token_accepts_conforming_token() {
+    let (env, contract_id, _token_id, admin, _sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let new_token = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    client.add_approved_token(&admin, &new_token);
+
+    let token_key = DataKey::ApprovedToken(new_token.clone());
+    env.as_contract(&contract_id, || {
+        assert!(env.storage().instance().has(&token_key));
+    });
+}
+
+#[test]
+#[should_panic(expected = "invalid token: decimals() call failed")]
+fn test_add_approved_token_rejects_non_contract_address() {
+    let (env, contract_id, _token_id, admin, _sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    client.add_approved_token(&admin, &Address::generate(&env));
+}
+
+#[test]
+#[should_panic(expected = "invalid token: decimals() call failed")]
+fn test_add_approved_token_rejects_contract_without_token_interface() {
+    let (env, contract_id, _token_id, admin, _sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let not_a_token = env.register(not_a_token::NotATokenContract, ());
+    client.add_approved_token(&admin, &not_a_token);
+}
+
+#[test]
+#[should_panic(expected = "invalid token: decimal precision must be 7 (found 18)")]
+fn test_add_approved_token_rejects_wrong_decimals() {
+    let (env, contract_id, _token_id, admin, _sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let bad_token = env.register(wrong_decimals_token::WrongDecimalsToken, ());
+    client.add_approved_token(&admin, &bad_token);
+}
+
+#[test]
+#[should_panic(expected = "invalid token: balance() call failed")]
+fn test_add_approved_token_rejects_trapping_balance() {
+    let (env, contract_id, _token_id, admin, _sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let bad_token = env.register(broken_balance_token::BrokenBalanceToken, ());
+    client.add_approved_token(&admin, &bad_token);
+}
+
+#[test]
+#[should_panic(expected = "invalid token: balance() returned a negative amount")]
+fn test_add_approved_token_rejects_negative_balance() {
+    let (env, contract_id, _token_id, admin, _sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let bad_token = env.register(negative_balance_token::NegativeBalanceToken, ());
+    client.add_approved_token(&admin, &bad_token);
+}
+
+// ============================================================
+// UPGRADE STORAGE COMPATIBILITY & MIGRATION
+// ============================================================
+//
+// REQUIRED REGRESSION TESTS: whenever any stored `#[contracttype]` struct
+// (Course, Enrollment, Certificate, ...) is modified, the tests in this
+// section must keep passing. A `#[contracttype]` struct only decodes from a
+// stored map containing exactly its fields, so a field change makes
+// pre-upgrade records unreadable unless a `migrate()` step rewrites them.
+
+/// Simulate `upgrade_contract` swapping in Wasm with the current schema.
+///
+/// Unit tests run natively and cannot upload real Wasm, so instead the
+/// native contract is re-registered at the same address. Like
+/// `update_current_contract_wasm`, this replaces only the executable and
+/// keeps all instance and persistent storage written before the swap.
+fn simulate_upgrade(env: &Env, contract_id: &Address) {
+    env.register_at(contract_id, SorobanLardContract, ());
+}
+
+#[test]
+fn test_records_deserialize_unchanged_after_simulated_upgrade() {
+    use soroban_sdk::xdr::ToXdr;
+
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    let course_id = String::from_str(&env, "COURSE-UPGRADE-001");
+    let cert_id = String::from_str(&env, "CERT-UPGRADE-001");
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-UPGRADE-001",
+        500_000_000,
+    );
+    client.enroll(&student, &course_id);
+    client.mark_completed(
+        &admin,
+        &student,
+        &course_id,
+        &Some(String::from_str(&env, "evidence_hash")),
+    );
+    client.issue_certificate(
+        &admin,
+        &student,
+        &course_id,
+        &cert_id,
+        &String::from_str(&env, "Upgrade Course"),
+        &get_enrollment_ref(&env, &client, &student, "COURSE-UPGRADE-001"),
+        &None,
+        &None,
+    );
+
+    // Snapshot the exact encoding of each record written by the "old" code.
+    let course_before = client.get_course(&course_id).unwrap().to_xdr(&env);
+    let enrollment_before = client
+        .get_enrollment(&student, &student, &course_id)
+        .unwrap()
+        .to_xdr(&env);
+    let certificate_before = client.get_certificate(&student, &cert_id).to_xdr(&env);
+
+    simulate_upgrade(&env, &contract_id);
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    // The "new" code must decode the same records into identical values.
+    assert_eq!(
+        client.get_course(&course_id).unwrap().to_xdr(&env),
+        course_before
+    );
+    assert_eq!(
+        client
+            .get_enrollment(&student, &student, &course_id)
+            .unwrap()
+            .to_xdr(&env),
+        enrollment_before
+    );
+    assert_eq!(
+        client.get_certificate(&student, &cert_id).to_xdr(&env),
+        certificate_before
+    );
+    assert!(client.verify_certificate(&cert_id));
+    assert_eq!(client.has_completed(&student, &course_id), Some(true));
+    assert_eq!(
+        client.get_storage_schema_version(),
+        SorobanLardContract::STORAGE_SCHEMA_VERSION
+    );
+}
+
+/// Shape of a stored record as written by the pre-upgrade Wasm.
+#[soroban_sdk::contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct MigrationRecordV1 {
+    pub id: String,
+    pub price: i128,
+}
+
+/// The same record after a release adds a field (as `Option<T>`).
+#[soroban_sdk::contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct MigrationRecordV2 {
+    pub id: String,
+    pub price: i128,
+    pub discount_bps: Option<u32>,
+}
+
+#[test]
+fn test_struct_gaining_field_old_records_deserialize_and_migrate() {
+    let (env, contract_id, _token_id, _admin, _sec_admin, _treasury, _instructor) = setup();
+
+    let key = Symbol::new(&env, "migration_rec");
+    let old_record = MigrationRecordV1 {
+        id: String::from_str(&env, "COURSE-MIGRATE-001"),
+        price: 500_000_000,
+    };
+    env.as_contract(&contract_id, || {
+        env.storage().persistent().set(&key, &old_record);
+    });
+
+    simulate_upgrade(&env, &contract_id);
+
+    env.as_contract(&contract_id, || {
+        // The pre-upgrade record still decodes via the legacy type kept in
+        // the new Wasm.
+        let legacy: MigrationRecordV1 = env.storage().persistent().get(&key).unwrap();
+        assert_eq!(legacy, old_record);
+
+        // A migration step rewrites it in the new shape.
+        let migrated = MigrationRecordV2 {
+            id: legacy.id,
+            price: legacy.price,
+            discount_bps: None,
+        };
+        env.storage().persistent().set(&key, &migrated);
+
+        let after: MigrationRecordV2 = env.storage().persistent().get(&key).unwrap();
+        assert_eq!(after, migrated);
+    });
+}
+
+#[test]
+#[should_panic]
+fn test_struct_gaining_option_field_breaks_unmigrated_records() {
+    // Documents why `migrate()` is required: even a new `Option<T>` field
+    // makes a record written with the old shape undecodable as the new type.
+    let (env, contract_id, _token_id, _admin, _sec_admin, _treasury, _instructor) = setup();
+
+    let key = Symbol::new(&env, "migration_rec");
+    env.as_contract(&contract_id, || {
+        env.storage().persistent().set(
+            &key,
+            &MigrationRecordV1 {
+                id: String::from_str(&env, "COURSE-MIGRATE-001"),
+                price: 500_000_000,
+            },
+        );
+    });
+
+    simulate_upgrade(&env, &contract_id);
+
+    env.as_contract(&contract_id, || {
+        let _: Option<MigrationRecordV2> = env.storage().persistent().get(&key);
+    });
+}
+
+#[test]
+fn test_storage_schema_version_defaults_to_current() {
+    let (env, contract_id, _token_id, _admin, _sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    assert_eq!(
+        client.get_storage_schema_version(),
+        SorobanLardContract::STORAGE_SCHEMA_VERSION
+    );
+}
+
+#[test]
+#[should_panic(expected = "storage already at current schema version")]
+fn test_migrate_rejected_when_already_current() {
+    let (env, contract_id, _token_id, admin, sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    client.migrate(&admin, &sec_admin);
+}
+
+#[test]
+#[should_panic(expected = "unauthorized: requires both admin signatures")]
+fn test_migrate_unauthorized_fails() {
+    let (env, contract_id, _token_id, admin, _sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let random = Address::generate(&env);
+    client.migrate(&admin, &random);
+}
+
+#[test]
+fn test_current_wasm_hash_none_before_first_upgrade() {
+    let (env, contract_id, _token_id, _admin, _sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    assert_eq!(client.get_current_wasm_hash(), None);
+}

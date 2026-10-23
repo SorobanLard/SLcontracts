@@ -56,6 +56,7 @@ This is **Repo 1 of 3** in the SorobanLard project:
 - [Prerequisites](#prerequisites)
 - [Setup & Installation](#setup--installation)
 - [Running Tests](#running-tests)
+- [Upgrades & Storage Migrations](#upgrades--storage-migrations)
 - [Building](#building)
 - [Deploying to Testnet](#deploying-to-testnet)
 - [Security Considerations](#security-considerations)
@@ -319,6 +320,8 @@ Returns `true` if the certificate exists and has not been revoked. The `get_cert
 | `certificate_revoked` | `certificate_id` | Certificate revoked |
 | `course_certificates_revoked` | `(admin, course_id, revoked_count, ledger)` | All certificates of a course bulk-revoked |
 | `admin_transferred` | `new_admin` | Admin role transferred |
+| `upgrade_executed` | `(old_wasm_hash: Option<BytesN<32>>, new_wasm_hash, admin1, admin2, ledger_sequence)` | `upgrade_contract` swaps the contract Wasm (topic also carries `new_wasm_hash`). `old_wasm_hash` is `None` for a deployment's first upgrade |
+| `storage_migrated` | `(from_version, to_version, admin1, admin2, ledger_sequence)` | `migrate()` transforms stored records after an upgrade |
 | `dispute_escalated` | `(caller, course_id, fee)` | Arbitration case opened |
 | `arbitration_resolved` | `(caller, course_id, for_student, admin)` | Admin resolved an open case |
 | `arbitration_auto_refunded` | `(caller, course_id, fee, ledger)` | Case timed out; fee refunded to the escalating caller |
@@ -419,6 +422,20 @@ test test::test_register_duplicate_course ............... ok
 test test::test_revoke_certificate ...................... ok
 test test::test_update_platform_fee ...................... ok
 ```
+
+---
+
+## Upgrades & Storage Migrations
+
+`upgrade_contract` replaces only the contract Wasm; every stored record keeps the encoding written by the old code. A `#[contracttype]` struct is stored as a map keyed by field name, and decoding requires that map to contain **exactly** the struct's fields. Adding, removing, or renaming a field — even an `Option<T>` one — makes every pre-upgrade record of that type undecodable by the new Wasm.
+
+When a release changes a stored struct (`Course`, `Enrollment`, `Certificate`, ...):
+
+1. Keep the old shape in the new code as a legacy type (e.g. `CourseV1`). Add new fields as `Option<T>` so a migration can leave them unset when there is no sensible backfill value.
+2. Bump `STORAGE_SCHEMA_VERSION` and add a step to `run_migration_step` that reads each affected record as the legacy type and rewrites it in the new shape.
+3. After `upgrade_contract` executes, both admins call `migrate(admin1, admin2)` once. It applies every pending step in order, records the new version (`get_storage_schema_version()`), and rejects repeat calls.
+
+**Required regression tests:** the tests under "UPGRADE STORAGE COMPATIBILITY & MIGRATION" in `src/test.rs` (`test_records_deserialize_unchanged_after_simulated_upgrade` and the migration tests) simulate an upgrade and read back records written before it. They must pass for any change to a `#[contracttype]` struct; extend them with the legacy/new shapes whenever a migration step is added.
 
 ---
 

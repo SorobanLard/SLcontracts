@@ -34,6 +34,7 @@
 //! - `set_admin_expiry` — sets a ledger sequence when the admin role expires (blocks all admin operations)
 //! - `propose_upgrade` / `upgrade_contract` / `cancel_upgrade` — time-locked contract code
 //!   upgrade; see "Contract Upgrades" below
+//! - `migrate` — one-time post-upgrade storage schema migration
 //!
 //! ## Student Blocking Policy
 //! - `block_student()` called by the admin prevents a student from:
@@ -114,6 +115,12 @@
 //! - A compromised single admin key cannot upgrade the contract — both admin signatures
 //!   are required for every step, and the time-lock gives observers a chance to react to
 //!   a malicious proposal before it can take effect.
+//! - Every executed upgrade emits `upgrade_executed` with the previous and new Wasm hash
+//!   and the ledger sequence (`old_wasm_hash` is `None` for a deployment's first upgrade).
+//! - Stored `#[contracttype]` structs must decode from a map with exactly their fields, so
+//!   changing a stored struct (even adding an `Option<T>` field) breaks pre-upgrade records.
+//!   Such releases bump `STORAGE_SCHEMA_VERSION`, add a `run_migration_step` arm, and both
+//!   admins call `migrate()` once after `upgrade_contract` to rewrite the affected records.
 //!
 //! ## Storage Tiers
 //!
@@ -759,6 +766,14 @@ contract_data_key! {
         /// Append-only list of course IDs for which a student has opened an
         /// arbitration case. Preserved after resolution.
         StudentArbitrationCases(Address),
+        /// Wasm hash installed by the most recent `upgrade_contract` call.
+        /// Absent until the first upgrade executes, since the host does not
+        /// expose the currently running Wasm hash to the contract.
+        CurrentWasmHash,
+        /// Storage schema version that persisted/instance records are known to
+        /// conform to. Absent means `STORAGE_SCHEMA_VERSION_INITIAL`. Advanced
+        /// only by `migrate()`.
+        StorageSchemaVersion,
     }
 }
 
@@ -826,6 +841,13 @@ impl SorobanLardContract {
     /// sequences (~17,280 ledgers ≈ 1 day at 5s/ledger). Used when the
     /// admin has not configured a custom value via `set_upgrade_timelock`.
     const DEFAULT_UPGRADE_TIMELOCK_LEDGERS: u32 = 17_280;
+    /// Storage schema version assumed for a deployment that has never run
+    /// `migrate()`.
+    const STORAGE_SCHEMA_VERSION_INITIAL: u32 = 1;
+    /// Storage schema version this Wasm expects. Bump it (and add a step to
+    /// `run_migration_step`) whenever a release changes the shape of any
+    /// stored `#[contracttype]` record.
+    pub(crate) const STORAGE_SCHEMA_VERSION: u32 = 1;
     /// Hard floor for the upgrade governance time-lock, in ledger sequences
     /// (~17,280 ledgers ≈ 1 day at 5s/ledger). `set_upgrade_timelock` rejects
     /// any lower value so a compromised admin pair cannot shrink the review
@@ -4156,12 +4178,15 @@ impl SorobanLardContract {
 
     /// Admin adds a token contract address to the enrollment whitelist.
     ///
+    /// Before the token is accepted it is exercised with a minimal SEP-41
+    /// sanity check (see `validate_token_interface`), so a non-token or
+    /// non-conforming contract is rejected at approval time rather than
+    /// surfacing later as unpredictable enrollment failures.
     /// # Admin requirement — standard tokens only
     ///
     /// Only approve standard, fee-free, non-rebasing SAC-style tokens (e.g.
-    /// the Stellar Asset Contract for USDC). The contract does not, and
-    /// cannot, check this here: the only on-chain token check is the 7-decimal
-    /// check in `register_course` / `validate_enrollment`.
+    /// the Stellar Asset Contract for USDC). The interface check cannot
+    /// prove that transfers are fee-free or balances will not rebase.
     ///
     /// Instructor earnings are a plain stroops counter
     /// (`DataKey::InstructorEarnings`). It is only correct if every
@@ -4188,6 +4213,7 @@ impl SorobanLardContract {
             panic!("token cannot be the contract address");
         }
 
+        Self::validate_token_interface(&env, &token);
         env.storage()
             .instance()
             .set(&DataKey::ApprovedToken(token.clone()), &true);
@@ -5030,12 +5056,23 @@ impl SorobanLardContract {
 
         env.storage().instance().remove(&DataKey::PendingUpgrade);
 
+        // Record the previous and new Wasm hash so off-chain monitoring can
+        // alert on every live code swap. `old_wasm_hash` is `None` for the
+        // first upgrade of a deployment, because the host does not expose the
+        // running Wasm hash and no prior upgrade has recorded it.
+        let old_wasm_hash: Option<BytesN<32>> =
+            env.storage().instance().get(&DataKey2::CurrentWasmHash);
+        env.storage()
+            .instance()
+            .set(&DataKey2::CurrentWasmHash, &pending.new_wasm_hash);
+
         env.events().publish(
             (
                 Symbol::new(&env, "upgrade_executed"),
                 pending.new_wasm_hash.clone(),
             ),
             (
+                old_wasm_hash,
                 pending.new_wasm_hash.clone(),
                 admin1,
                 admin2,
@@ -5045,6 +5082,99 @@ impl SorobanLardContract {
 
         env.deployer()
             .update_current_contract_wasm(pending.new_wasm_hash);
+    }
+
+    /// Get the Wasm hash installed by the most recent `upgrade_contract`
+    /// call, or `None` if the contract has never been upgraded.
+    pub fn get_current_wasm_hash(env: Env) -> Option<BytesN<32>> {
+        env.storage().instance().get(&DataKey2::CurrentWasmHash)
+    }
+
+    // ----------------------------------------------------------
+    // POST-UPGRADE STORAGE MIGRATION
+    // ----------------------------------------------------------
+    //
+    // `upgrade_contract` only swaps code; stored records keep the exact
+    // encoding written by the old Wasm. A `#[contracttype]` struct is
+    // encoded as a map keyed by field name and decoding requires the stored
+    // map to contain *exactly* the struct's fields — so adding, removing or
+    // renaming a field (even an `Option<T>` one) makes every pre-upgrade
+    // record of that type undecodable by the new Wasm.
+    //
+    // Pattern for a release that changes a stored struct:
+    //   1. Keep the old shape in the new Wasm as a legacy type (e.g.
+    //      `CourseV1`) and add the new shape (prefer `Option<T>` for new
+    //      fields so a migration can leave them unset when no sensible
+    //      backfill exists).
+    //   2. Bump `STORAGE_SCHEMA_VERSION` and add a step to
+    //      `run_migration_step` that reads each affected record as the
+    //      legacy type and rewrites it in the new shape.
+    //   3. After `upgrade_contract` lands, both admins call `migrate()`
+    //      once. It applies each pending step in order and records the new
+    //      version; calling it again is rejected.
+    //   4. Add a regression test that writes records with the old shape,
+    //      simulates the upgrade and migration, and reads them back.
+
+    /// Run pending storage migrations after an upgrade. Requires both admin
+    /// signatures.
+    ///
+    /// Applies every migration step from the stored schema version up to
+    /// `STORAGE_SCHEMA_VERSION` (the version this Wasm expects), then
+    /// records the new version so the same steps can never run twice.
+    /// Panics if storage is already at the current version.
+    pub fn migrate(env: Env, admin1: Address, admin2: Address) {
+        admin1.require_auth();
+        admin2.require_auth();
+        Self::require_multi_admin(&env, &admin1, &admin2);
+
+        let from_version = Self::get_storage_schema_version(env.clone());
+        if from_version >= Self::STORAGE_SCHEMA_VERSION {
+            panic!("storage already at current schema version");
+        }
+
+        env.storage()
+            .instance()
+            .extend_ttl(Self::INSTANCE_TTL_THRESHOLD, Self::INSTANCE_TTL_EXTEND_TO);
+
+        let mut version = from_version;
+        while version < Self::STORAGE_SCHEMA_VERSION {
+            Self::run_migration_step(&env, version);
+            version += 1;
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey2::StorageSchemaVersion, &version);
+
+        env.events().publish(
+            (Symbol::new(&env, "storage_migrated"), admin1.clone()),
+            (from_version, version, admin1, admin2, env.ledger().sequence()),
+        );
+    }
+
+    /// Get the storage schema version currently recorded on-chain.
+    pub fn get_storage_schema_version(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey2::StorageSchemaVersion)
+            .unwrap_or(Self::STORAGE_SCHEMA_VERSION_INITIAL)
+    }
+
+    /// Transform stored records from schema `from_version` to
+    /// `from_version + 1`. Add a match arm here for every bump of
+    /// `STORAGE_SCHEMA_VERSION`.
+    fn run_migration_step(_env: &Env, from_version: u32) {
+        match from_version {
+            // Example for a future v1 -> v2 release that adds a field to
+            // `Course`:
+            //   1 => {
+            //       for course_id in Self::get_all_course_ids(...) {
+            //           let old: CourseV1 = storage.get(&key).unwrap();
+            //           storage.set(&key, &Course::from_v1(old));
+            //       }
+            //   }
+            _ => panic!("no migration step defined for schema version {}", from_version),
+        }
     }
 
     /// Configure the upgrade governance time-lock, in ledger sequences.
@@ -5480,6 +5610,42 @@ impl SorobanLardContract {
             if env.ledger().sequence() >= expires_at {
                 panic!("admin role has expired");
             }
+        }
+    }
+
+    /// Minimal SEP-41 sanity check run before a token is whitelisted.
+    ///
+    /// Uses fallible `try_*` calls so that an address that is not a contract,
+    /// does not export the token interface, or traps/returns the wrong type
+    /// is rejected with a clear message instead of an opaque host error.
+    /// Checks performed:
+    ///   - `decimals()` succeeds and equals the 7-decimal precision that
+    ///     `register_course` requires (a token failing this could never be
+    ///     used for a course anyway);
+    ///   - `balance(current_contract)` succeeds and is non-negative.
+    /// A zero-amount `transfer` is intentionally not performed: on the
+    /// Stellar Asset Contract it writes a balance entry for the receiver
+    /// and fails for auth-required assets, so it would add side effects to
+    /// an admin configuration call without adding meaningful assurance.
+    fn validate_token_interface(env: &Env, token: &Address) {
+        const EXPECTED_TOKEN_DECIMALS: u32 = 7;
+        let token_client = token::Client::new(env, token);
+
+        let decimals = match token_client.try_decimals() {
+            Ok(Ok(decimals)) => decimals,
+            _ => panic!("invalid token: decimals() call failed"),
+        };
+        if decimals != EXPECTED_TOKEN_DECIMALS {
+            panic!(
+                "invalid token: decimal precision must be {} (found {})",
+                EXPECTED_TOKEN_DECIMALS, decimals
+            );
+        }
+
+        match token_client.try_balance(&env.current_contract_address()) {
+            Ok(Ok(balance)) if balance >= 0 => {}
+            Ok(Ok(_)) => panic!("invalid token: balance() returned a negative amount"),
+            _ => panic!("invalid token: balance() call failed"),
         }
     }
 
