@@ -13296,3 +13296,268 @@ fn test_issue242_freeze_pauses_active_courses() {
     let course = client.get_course(&String::from_str(&env, "FREEZE-PAUSE")).unwrap();
     assert_eq!(course.status, CourseStatus::Paused);
 }
+
+// ============================================================
+// ISSUE #131 — enroll_internal with a zero-price (free) course
+// ============================================================
+
+#[test]
+fn test_enroll_zero_price_skips_payment_split_and_transfers() {
+    let (env, contract_id, token_id, admin, _sec_admin, treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+
+    // Configure every fee input that could feed the payment split at its
+    // most aggressive setting: 100% per-token fee, risk surcharges enabled,
+    // and an explicit course-level fee override. None of them may have any
+    // effect on a free course.
+    client.set_fee_config(&admin, &token_id, &10_000u32);
+    client.set_risk_config_enabled(&admin, &true);
+    client.set_risk_fee_config(&admin, &500u32, &0i128, &700u32, &900u32);
+
+    let course_id = String::from_str(&env, "COURSE-FREE-131");
+    client.register_course(
+        &instructor,
+        &course_id,
+        &0i128,
+        &token_id,
+        &100u32,
+        &None,
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &soroban_sdk::Vec::new(&env),
+    );
+    env.ledger().with_mut(|l| {
+        l.sequence_number += 1;
+    });
+    client.approve_course(&admin, &course_id);
+
+    // A student with no token balance can still enroll in a free course.
+    let student = Address::generate(&env);
+    assert_eq!(token_client.balance(&student), 0);
+
+    let contract_before = token_client.balance(&contract_id);
+    let treasury_before = token_client.balance(&treasury);
+
+    client.enroll(&student, &course_id);
+
+    let enrollment = client
+        .get_enrollment(&student, &student, &course_id)
+        .unwrap();
+    assert_eq!(enrollment.amount_paid, 0);
+    assert_eq!(enrollment.platform_amount, 0);
+    assert_eq!(enrollment.instructor_amount, 0);
+
+    assert_eq!(token_client.balance(&student), 0);
+    assert_eq!(token_client.balance(&contract_id), contract_before);
+    assert_eq!(token_client.balance(&treasury), treasury_before);
+    assert_eq!(client.get_instructor_earnings(&instructor, &token_id), 0);
+    assert_eq!(client.get_instructor_total_earnings(&instructor), 0);
+
+    let course = client.get_course(&course_id).unwrap();
+    assert_eq!(course.total_enrollments, 1);
+    assert_eq!(course.total_earned, 0);
+
+    // The fee preview agrees: no fee or surcharge applies to a free course.
+    let preview = client.get_effective_fee_for_payment(&student, &token_id, &0i128);
+    assert_eq!(preview.platform_fee, 0);
+    assert_eq!(preview.risk_surcharge_bps, 0);
+}
+
+#[test]
+fn test_refund_zero_price_enrollment_moves_no_tokens() {
+    let (env, contract_id, token_id, admin, _sec_admin, treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-FREE-REFUND",
+        0,
+    );
+    let course_id = String::from_str(&env, "COURSE-FREE-REFUND");
+
+    let student = Address::generate(&env);
+    client.enroll(&student, &course_id);
+
+    let treasury_before = token_client.balance(&treasury);
+    let contract_before = token_client.balance(&contract_id);
+
+    client.request_refund(&student, &course_id);
+    env.mock_all_auths_allowing_non_root_auth();
+    client.process_refund(&admin, &student, &course_id, &true);
+
+    assert!(client
+        .get_enrollment(&student, &student, &course_id)
+        .is_none());
+    assert_eq!(token_client.balance(&student), 0);
+    assert_eq!(token_client.balance(&treasury), treasury_before);
+    assert_eq!(token_client.balance(&contract_id), contract_before);
+    assert_eq!(client.get_instructor_earnings(&instructor, &token_id), 0);
+}
+
+// ============================================================
+// ISSUE #137 — current_contract_address() self-reference guards
+// ============================================================
+
+/// Register a fresh contract so `init` can be tested with arbitrary addresses.
+fn setup_uninitialized() -> (Env, Address) {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(SorobanLardContract, ());
+    (env, contract_id)
+}
+
+#[test]
+#[should_panic(expected = "treasury cannot be the contract address")]
+fn test_init_rejects_contract_as_treasury() {
+    let (env, contract_id) = setup_uninitialized();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    client.init(
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &contract_id,
+        &20u32,
+        &50u32,
+        &1000u32,
+        &17_280u32,
+    );
+}
+
+#[test]
+#[should_panic(expected = "admin cannot be the contract address")]
+fn test_init_rejects_contract_as_admin() {
+    let (env, contract_id) = setup_uninitialized();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    client.init(
+        &contract_id,
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &20u32,
+        &50u32,
+        &1000u32,
+        &17_280u32,
+    );
+}
+
+#[test]
+#[should_panic(expected = "secondary_admin cannot be the contract address")]
+fn test_init_rejects_contract_as_secondary_admin() {
+    let (env, contract_id) = setup_uninitialized();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    client.init(
+        &Address::generate(&env),
+        &contract_id,
+        &Address::generate(&env),
+        &20u32,
+        &50u32,
+        &1000u32,
+        &17_280u32,
+    );
+}
+
+#[test]
+#[should_panic(expected = "token cannot be the contract address")]
+fn test_add_approved_token_rejects_contract_address() {
+    let (env, contract_id, _token_id, admin, _sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    client.add_approved_token(&admin, &contract_id);
+}
+
+#[test]
+#[should_panic(expected = "treasury cannot be the contract address")]
+fn test_update_treasury_rejects_contract_address() {
+    let (env, contract_id, _token_id, admin, sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    client.update_treasury(&admin, &sec_admin, &contract_id);
+}
+
+#[test]
+#[should_panic(expected = "admin cannot be the contract address")]
+fn test_transfer_admin_rejects_contract_as_new_admin() {
+    let (env, contract_id, _token_id, admin, sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    client.transfer_admin(&admin, &sec_admin, &contract_id, &Address::generate(&env));
+}
+
+#[test]
+#[should_panic(expected = "secondary_admin cannot be the contract address")]
+fn test_transfer_admin_rejects_contract_as_new_secondary_admin() {
+    let (env, contract_id, _token_id, admin, sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    client.transfer_admin(&admin, &sec_admin, &Address::generate(&env), &contract_id);
+}
+
+#[test]
+#[should_panic(expected = "approver cannot be the contract address")]
+fn test_add_approver_rejects_contract_address() {
+    let (env, contract_id, _token_id, admin, _sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    client.add_approver(&admin, &contract_id);
+}
+
+#[test]
+#[should_panic(expected = "withdraw_tokens: destination cannot be the contract address")]
+fn test_withdraw_tokens_rejects_contract_as_destination() {
+    let (env, contract_id, token_id, admin, sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    token::StellarAssetClient::new(&env, &token_id).mint(&contract_id, &1_000_000i128);
+    client.withdraw_tokens(&admin, &sec_admin, &token_id, &1_000_000i128, &contract_id);
+}
+
+// ============================================================
+// ISSUE #141 — cancel_upgrade signature requirement
+// ============================================================
+
+#[test]
+fn test_cancel_upgrade_accepts_admins_in_either_order() {
+    let (env, contract_id, _token_id, admin, sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    client.propose_upgrade(&admin, &sec_admin, &BytesN::from_array(&env, &[7u8; 32]));
+    client.cancel_upgrade(&sec_admin, &admin);
+    assert!(client.get_pending_upgrade().is_none());
+}
+
+#[test]
+fn test_cancel_upgrade_rejects_single_admin_signing_twice() {
+    let (env, contract_id, _token_id, admin, sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    client.propose_upgrade(&admin, &sec_admin, &BytesN::from_array(&env, &[7u8; 32]));
+    // A single admin cannot cancel unilaterally by passing itself twice.
+    assert!(client.try_cancel_upgrade(&admin, &admin).is_err());
+}
+
+#[test]
+fn test_cancel_upgrade_requires_auth_from_both_admins() {
+    let (env, contract_id, _token_id, admin, sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    client.propose_upgrade(&admin, &sec_admin, &BytesN::from_array(&env, &[7u8; 32]));
+
+    // Only the primary admin signs, so the secondary admin's auth is missing.
+    let res = client
+        .mock_auths(&[MockAuth {
+            address: &admin,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "cancel_upgrade",
+                args: (admin.clone(), sec_admin.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_cancel_upgrade(&admin, &sec_admin);
+    assert!(
+        res.is_err(),
+        "cancel_upgrade must require the secondary admin's signature"
+    );
+
+    env.mock_all_auths();
+    assert!(client.get_pending_upgrade().is_some());
+}
+
+mod proptests;

@@ -105,7 +105,8 @@
 //! - Upgrades are two-step and time-locked: `propose_upgrade` (both admins) records the
 //!   new Wasm hash and starts a `get_upgrade_timelock()`-ledger review window (default
 //!   ~1 day); `upgrade_contract` (both admins) executes it only after that window has
-//!   elapsed. `cancel_upgrade` withdraws a pending proposal at any time.
+//!   elapsed. `cancel_upgrade` (both admins) withdraws a pending proposal at any time;
+//!   there is no single-admin emergency cancel (see `cancel_upgrade` docs).
 //! - `set_upgrade_timelock` enforces a hard floor of `MIN_UPGRADE_TIMELOCK_LEDGERS`
 //!   (~1 day), so the review window can never be configured to zero.
 //! - `get_contract_version()` returns the semantic version of the live code so
@@ -886,11 +887,17 @@ impl SorobanLardContract {
     ///
     /// # Arguments
     /// - `admin`                    — admin address (approves courses, issues certificates)
+    /// - `secondary_admin`          — second admin required for multi-sig operations
     /// - `treasury`                 — platform treasury address (receives platform fee share)
     /// - `default_fee_pct`          — default platform fee percentage (e.g. 20 = 20%)
     /// - `refund_window_ledgers`    — number of ledger sequences after enrollment during which a
     ///                                refund request is accepted; requests after this window are
     ///                                automatically rejected (e.g. 17_280 ≈ 1 day at 5s/ledger)
+    ///
+    /// # Panics
+    /// - If `admin`, `secondary_admin` or `treasury` is the contract's own
+    ///   address (#137)
+    /// - If any two of `admin`, `secondary_admin` and `treasury` are equal
     pub fn init(
         env: Env,
         admin: Address,
@@ -911,8 +918,22 @@ impl SorobanLardContract {
             panic!("fee percentage cannot exceed 100");
         }
 
-        if treasury == env.current_contract_address() {
+        // The contract must never be configured as one of its own privileged
+        // or fee-receiving addresses: a contract-owned admin would make
+        // `require_auth()` checks satisfiable by the contract itself, and a
+        // contract-owned treasury would trap platform fees. (#137)
+        let contract_address = env.current_contract_address();
+
+        if treasury == contract_address {
             panic!("treasury cannot be the contract address");
+        }
+
+        if admin == contract_address {
+            panic!("admin cannot be the contract address");
+        }
+
+        if secondary_admin == contract_address {
+            panic!("secondary_admin cannot be the contract address");
         }
 
         if admin == treasury {
@@ -2265,6 +2286,18 @@ impl SorobanLardContract {
     ///
     /// A student cannot enroll in the same course twice.
     ///
+    /// # Free (zero-price) courses (#131)
+    /// A course price of exactly `0` is a supported case. The payment split
+    /// never divides by the price — the platform fee is computed as
+    /// `price * fee_bps / 10_000` — and `deduct_fee()` short-circuits to
+    /// `(0, 0)` for a non-positive amount. `enroll_internal()` additionally
+    /// skips the whole token-transfer block when `price == 0`, so no token
+    /// call is made, the student needs no balance, the treasury and
+    /// instructor earnings are untouched, and the enrollment is recorded
+    /// with `amount_paid`, `platform_amount` and `instructor_amount` all
+    /// equal to `0`. Any per-token fee, course fee override or risk
+    /// surcharge has no effect on a free course.
+    ///
     /// # Arguments
     /// - `student`   — student's Stellar address (must sign)
     /// - `course_id` — the course to enroll in
@@ -2604,6 +2637,10 @@ impl SorobanLardContract {
             .set(&failure_key, &new_failure_count);
         Self::extend_persistent_ttl(env, &failure_key);
 
+        // Zero-price (free) courses skip this block entirely (#131): no
+        // token transfer, balance check, fee distribution or earnings credit
+        // takes place, and `platform_amount`/`instructor_amount` are already
+        // `(0, 0)` because `deduct_fee()` short-circuits on a zero amount.
         let actual_amount_paid = if course.price > 0 {
             // Verify actual transfer amount by checking balance before and after
             let balance_before = token_client.balance(&env.current_contract_address());
@@ -3851,6 +3888,13 @@ impl SorobanLardContract {
         admin1.require_auth();
         admin2.require_auth();
         Self::require_multi_admin(&env, &admin1, &admin2);
+
+        // #137 — Sweeping tokens to the contract itself is a no-op transfer
+        // that would still emit a misleading `tokens_withdrawn` event.
+        if destination == env.current_contract_address() {
+            panic!("withdraw_tokens: destination cannot be the contract address");
+        }
+
         let token_client = token::Client::new(&env, &token);
         token_client.transfer(&env.current_contract_address(), &destination, &amount);
 
@@ -3893,6 +3937,16 @@ impl SorobanLardContract {
 
         if new_admin == new_secondary_admin {
             panic!("admin and secondary_admin must be distinct addresses");
+        }
+
+        // #137 — Same self-reference guard as init(): the contract can never
+        // be nominated as one of its own admins.
+        if new_admin == env.current_contract_address() {
+            panic!("admin cannot be the contract address");
+        }
+
+        if new_secondary_admin == env.current_contract_address() {
+            panic!("secondary_admin cannot be the contract address");
         }
 
         // #176 — Enforce minimum cooldown between consecutive transfer_admin() calls.
@@ -4126,6 +4180,14 @@ impl SorobanLardContract {
     pub fn add_approved_token(env: Env, admin: Address, token: Address) {
         admin.require_auth();
         Self::require_admin(&env, &admin, "add_approved_token");
+
+        // #137 — The contract is not a token contract; whitelisting its own
+        // address would let courses be priced in a "token" whose transfer()
+        // calls re-enter this contract.
+        if token == env.current_contract_address() {
+            panic!("token cannot be the contract address");
+        }
+
         env.storage()
             .instance()
             .set(&DataKey::ApprovedToken(token.clone()), &true);
@@ -4285,6 +4347,11 @@ impl SorobanLardContract {
 
         if approver == admin {
             panic!("approver cannot be the admin address");
+        }
+
+        // #137 — The contract cannot be granted approver authority over itself.
+        if approver == env.current_contract_address() {
+            panic!("approver cannot be the contract address");
         }
 
         // Verify the address is not already an approver
@@ -4834,7 +4901,10 @@ impl SorobanLardContract {
     //      `effective_ledger` has passed, to actually swap the code.
     // This gives observers a mandatory window to review a pending upgrade
     // (and, if compromised, react) before it can take effect. A pending
-    // upgrade can be withdrawn at any time via `cancel_upgrade`.
+    // upgrade can be withdrawn at any time via `cancel_upgrade`, which —
+    // like proposing and executing — requires BOTH admin signatures.
+    // There is currently no single-admin emergency-cancel path (see the
+    // `cancel_upgrade` doc comment for the security trade-off).
     //
     // Enrollment, certificate, and all other contract storage is untouched
     // by an upgrade — only the executable Wasm code is replaced, so
@@ -4885,6 +4955,33 @@ impl SorobanLardContract {
     }
 
     /// Cancel a pending upgrade proposal. Requires both admin signatures.
+    ///
+    /// # Signature requirement (#141)
+    /// `admin1` and `admin2` must be the current `Admin` and `SecondaryAdmin`
+    /// (in either order), must be distinct, and must BOTH sign
+    /// (`require_auth()`), enforced by `require_multi_admin()`. The admin
+    /// expiry (`set_admin_expiry`) also applies. A single admin cannot cancel
+    /// unilaterally — this is the same requirement as `propose_upgrade` and
+    /// `upgrade_contract`.
+    ///
+    /// # Security trade-off
+    /// Because proposing also needs both signatures, a single compromised
+    /// key cannot propose a malicious upgrade on its own. However, if BOTH
+    /// keys were used to propose (or one admin was coerced into co-signing),
+    /// the remaining legitimate admin has no unilateral emergency brake:
+    /// cancellation needs the cooperation of the other signer. The
+    /// time-lock window is then the only defence, and responders must rely
+    /// on off-chain coordination (or `transfer_admin`, which itself needs
+    /// both signatures). A single-admin emergency-cancel path would be a
+    /// strictly "safe" action (it can only remove a pending upgrade, never
+    /// install one) and is tracked as a design discussion rather than
+    /// implemented here.
+    ///
+    /// # Panics
+    /// - `"unauthorized: requires both admin signatures"` if the callers are
+    ///   not exactly the two current admins
+    /// - `"admin role has expired"` if the admin expiry has passed
+    /// - `"no pending upgrade"` if nothing is pending
     pub fn cancel_upgrade(env: Env, admin1: Address, admin2: Address) {
         admin1.require_auth();
         admin2.require_auth();
@@ -5842,6 +5939,11 @@ impl SorobanLardContract {
     /// - `is_btc_eth` — whether the token is BTC/ETH (higher volatility)
     ///
     /// Returns `(net_amount, fee_amount)` where `net_amount + fee_amount == amount`.
+    ///
+    /// A zero (free course) or negative amount returns `(0, 0)` without
+    /// reading any fee configuration. The amount is only ever multiplied by
+    /// a basis-point rate and divided by the constant `10_000`, never used
+    /// as a divisor, so a zero price cannot cause a division-by-zero. (#131)
     fn deduct_fee(
         env: &Env,
         token: &Address,
