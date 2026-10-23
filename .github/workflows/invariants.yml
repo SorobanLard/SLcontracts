@@ -1,0 +1,14 @@
+name: Invariant coverage
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  invariant-coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Count invariant tests vs. documented invariants
+        run: ./scripts/check_invariants.sh

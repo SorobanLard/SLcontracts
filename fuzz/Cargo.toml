@@ -1,0 +1,23 @@
+[package]
+name = "sorobanlard-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+soroban-sdk = { version = "22", features = ["testutils"] }
+sorobanlard = { path = "../contracts/sorobanlard" }
+
+[[bin]]
+name = "register_course"
+path = "fuzz_targets/register_course.rs"
+test = false
+doc = false
+bench = false
+
+# Keep this crate out of the root workspace, which only lists contracts/*.
+[workspace]

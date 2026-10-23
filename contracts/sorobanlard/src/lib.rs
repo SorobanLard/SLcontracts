@@ -27,6 +27,8 @@
 //! ## Privileged Operations (multi-sig — both Admin + Secondary Admin required)
 //! - `withdraw_tokens` — emergency sweep of contract-held tokens (both admins required)
 //! - `archive_course` — permanent course removal; may trigger student refunds
+//! - `resolve_arbitration` — finalizes an open dispute and disburses the held
+//!   arbitration fee to the student or instructor (both admins required)
 //! - `transfer_admin` — proposes a new admin pair (new admins must then call `accept_admin`)
 //! - `update_treasury` — schedules a new treasury address (takes effect after 100 ledgers)
 //! - `set_admin_expiry` — sets a ledger sequence when the admin role expires (blocks all admin operations)
@@ -65,6 +67,16 @@
 //!   Any remainder (from integer truncation) stays with the instructor share.
 //! - The contract does **not** escrow student funds beyond the enrollment transaction;
 //!   post-enrollment refunds require admin-initiated archiving with an explicit refund list.
+//! - The split is all-or-nothing: if any transfer in `enroll` panics (including the
+//!   treasury transfer after the student's payment has already landed), the whole
+//!   invocation reverts, so no Enrollment, earnings credit or `total_earned` change is
+//!   kept. See `test_enroll_rolls_back_when_second_split_transfer_fails`.
+//!
+//! ## Token Assumptions
+//! - Approved tokens must be standard, fee-free, non-rebasing SAC-style tokens.
+//!   `DataKey::InstructorEarnings` is a plain counter. It only matches the contract's
+//!   real token balance if every transfer moves exactly the requested amount and
+//!   balances never change on their own. See `add_approved_token` for details.
 //!
 //! ## What This Contract Does NOT Protect Against
 //! - **Off-chain content access** — the contract cannot enforce that a student actually
@@ -94,7 +106,12 @@
 //! - Upgrades are two-step and time-locked: `propose_upgrade` (both admins) records the
 //!   new Wasm hash and starts a `get_upgrade_timelock()`-ledger review window (default
 //!   ~1 day); `upgrade_contract` (both admins) executes it only after that window has
-//!   elapsed. `cancel_upgrade` withdraws a pending proposal at any time.
+//!   elapsed. `cancel_upgrade` (both admins) withdraws a pending proposal at any time;
+//!   there is no single-admin emergency cancel (see `cancel_upgrade` docs).
+//! - `set_upgrade_timelock` enforces a hard floor of `MIN_UPGRADE_TIMELOCK_LEDGERS`
+//!   (~1 day), so the review window can never be configured to zero.
+//! - `get_contract_version()` returns the semantic version of the live code so
+//!   off-chain systems can detect when an upgrade has been executed.
 //! - A compromised single admin key cannot upgrade the contract — both admin signatures
 //!   are required for every step, and the time-lock gives observers a chance to react to
 //!   a malicious proposal before it can take effect.
@@ -104,6 +121,64 @@
 //!   changing a stored struct (even adding an `Option<T>` field) breaks pre-upgrade records.
 //!   Such releases bump `STORAGE_SCHEMA_VERSION`, add a `run_migration_step` arm, and both
 //!   admins call `migrate()` once after `upgrade_contract` to rewrite the affected records.
+//!
+//! ## Storage Tiers
+//!
+//! Contract state is split across two Soroban storage tiers:
+//!
+//! - **Instance storage** — small, singleton, or hot configuration values
+//!   (`Admin`, `Treasury`, fee config, pause flag, global counters). These
+//!   share the contract instance's rent/TTL and are extended by most write
+//!   paths, so they stay available for the lifetime of the contract.
+//! - **Persistent storage** — per-entity records and unbounded collections
+//!   (`Course`, `Enrollment`, `Certificate`, earnings, waitlists, history).
+//!   Each entry has its own rent/TTL, is extended on access, and is the only
+//!   tier that can grow without bound.
+//!
+//! Rule of thumb for a new `DataKey`: **singleton config, auth flag, or global
+//! counter → instance; per-course / per-student / per-instructor record or
+//! append-only list → persistent.** The full classification of every current
+//! key is in `docs/storage-keys.md`.
+//!
+//! ## Platform Active Enrollment Counter
+//!
+//! `TotalActiveEnrollments` is one instance-storage `u32` mutated by
+//! `enroll`, `batch_enroll`, `re_enroll`, `mark_completed`, `process_refund`,
+//! and `archive_course`. It is safe without compare-and-swap because Soroban
+//! serializes contract execution: a transaction's contract invocations run
+//! one at a time against a single ledger snapshot, and any concurrent-looking
+//! transactions are ordered by consensus into separate ledgers. Within one
+//! invocation the read-increment-write sequence is uninterrupted, and a panic
+//! rolls the whole invocation (including the counter write) back. There is
+//! therefore no stale-read interleaving where two enrollments both read the
+//! same value and lose an increment. See the
+//! `test_stress_total_active_enrollments_sequential` regression test.
+//!
+//! ## Dispute Resolution & Arbitration
+//!
+//! `escalate_to_arbitration` records an `ArbitrationCase` and pulls the
+//! configured fee into the contract. Escalation is intentionally **not**
+//! restricted to enrolled students: any authenticated address may open a case,
+//! including a student and the course instructor. This gives instructors the
+//! same recourse as students; the contract does not adjudicate the underlying
+//! refund or certificate decision, it only holds the fee until the case is
+//! resolved.
+//!
+//! A case is opened as `DisputeStatus::Open`. There are two ways it can leave
+//! that state:
+//!
+//! 1. An admin calls `resolve_arbitration` before the timeout, choosing whether
+//!    the fee goes to the escalating caller (`for_student = true`) or to the
+//!    course instructor (`for_student = false`).
+//! 2. If no admin resolves within `ARBITRATION_TIMEOUT_LEDGERS` (~1 day), any
+//!    address may call `claim_arbitration_timeout`. The fee is refunded to the
+//!    escalating party and the case becomes `DisputeStatus::AutoRefunded`.
+//!    This is a permissionless "auto-refund" trigger: Soroban contracts cannot
+//!    schedule their own execution, so the timeout is enforced by rejecting
+//!    late admin resolutions and letting anyone settle the case.
+//!
+//! Both resolution paths emit an event (`arbitration_resolved` /
+//! `arbitration_auto_refunded`) so off-chain indexers can reconcile the pool.
 
 #![no_std]
 
@@ -111,7 +186,8 @@
 extern crate std;
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, token, Address, BytesN, Env, Map, String, Symbol, Vec,
+    contract, contractimpl, contracttype, token, Address, BytesN, Env, IntoVal, Map, String,
+    Symbol, Val, Vec,
 };
 
 // ============================================================
@@ -156,6 +232,9 @@ pub enum DisputeStatus {
     ResolvedForStudent,
     /// Admin ruled in favour of the instructor (fee paid to instructor).
     ResolvedForInstructor,
+    /// No admin resolved the case within the arbitration timeout, so the fee
+    /// was automatically refunded to the escalating party.
+    AutoRefunded,
 }
 
 /// A persistent record of an arbitration case created by `escalate_to_arbitration`.
@@ -164,7 +243,9 @@ pub enum DisputeStatus {
 pub struct ArbitrationCase {
     /// Unique case identifier (student address + course_id).
     pub case_id: String,
-    /// The student / caller who escalated the dispute.
+    /// The address that escalated the dispute. Escalation is not restricted
+    /// by role, so this may be a student or the course instructor. The fee is
+    /// refunded to this address when the student wins or the case times out.
     pub caller: Address,
     /// The course this dispute concerns.
     pub course_id: String,
@@ -178,6 +259,46 @@ pub struct ArbitrationCase {
     pub opened_at_ledger: u32,
     /// Current status of the case.
     pub status: DisputeStatus,
+    /// Admin address that co-signed the resolution, if resolved. The
+    /// SecondaryAdmin co-signer is included in the `arbitration_resolved`
+    /// event.
+    pub resolved_by: Option<Address>,
+    /// Ledger sequence when the case was resolved, if resolved.
+    pub resolved_at_ledger: Option<u32>,
+    /// Reason / ruling note supplied by the resolving admins, if resolved.
+    pub resolution_reason: Option<String>,
+}
+
+/// Emitted when an arbitration case is resolved.
+///
+/// Topic layout:
+/// `(arbitration_resolved, case_id, resolved_for_student|resolved_for_instructor)`.
+///
+/// The outcome is repeated in the payload so an indexer that only persists
+/// event data can still notify both parties and update dispute status in the
+/// UI. `case_id` is the stable identifier of the dispute (currently derived
+/// from the caller and course pair).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ArbitrationResolved {
+    /// Unique case identifier for the dispute.
+    pub case_id: String,
+    /// Course the dispute concerns.
+    pub course_id: String,
+    /// Student who escalated the dispute.
+    pub caller: Address,
+    /// Instructor of the course when the case was opened.
+    pub instructor: Address,
+    /// Final outcome: `ResolvedForStudent` or `ResolvedForInstructor`.
+    pub outcome: DisputeStatus,
+    /// Arbitration fee disbursed when the case was resolved.
+    pub fee_paid: i128,
+    /// Admin that resolved the case.
+    pub resolved_by: Address,
+    /// Secondary admin that co-signed the resolution.
+    pub secondary_admin: Address,
+    /// Ledger sequence when the case was resolved.
+    pub resolved_at_ledger: u32,
 }
 
 /// Configuration for risk-based fee surcharges.
@@ -458,143 +579,216 @@ pub struct InstructorStats {
 // STORAGE KEYS
 // ============================================================
 
-#[contracttype]
-pub enum DataKey {
-    /// Course record by course ID
-    Course(String),
-    /// Immutable instructor address recorded at registration time
-    CourseInstructorRef(String),
-    /// Enrollment record by (student_address, course_id)
-    Enrollment(Address, String),
-    /// Certificate record by certificate ID
-    Certificate(String),
-    /// Admin address — set at init, can approve courses and issue certificates
-    Admin,
-    /// Secondary admin address for multi-sig operations
-    SecondaryAdmin,
-    /// Optional ledger sequence when the admin role expires
-    AdminExpiresAt,
-    /// Platform treasury address — receives the platform fee share
-    Treasury,
-    /// Platform default fee percentage (overrideable per course)
-    DefaultFee,
-    /// Pending platform treasury address and effective ledger sequence
-    PendingTreasury,
-    /// Whitelisted token contract address (used to validate course tokens)
-    ApprovedToken(Address),
-    /// Pending new admin address — must call accept_admin() to take effect
-    PendingAdmin,
-    /// Pending new secondary admin address
-    PendingSecondaryAdmin,
-    /// Platform paused state flag
-    PlatformPaused,
-    /// Accumulated instructor earnings per (instructor, token) pair (in stroops)
-    InstructorEarnings(Address, Address),
-    /// Accumulated instructor earnings across all tokens (in stroops)
-    InstructorTotalEarnings(Address),
-    /// Number of courses registered by an instructor
-    InstructorCourseCount(Address),
-    /// Number of currently pending courses for an instructor
-    InstructorPendingCourseCount(Address),
-    /// Ordered list of course IDs registered by a specific instructor
-    /// (append-only — course status changes never remove an entry).
-    InstructorCourseList(Address),
-    /// Maximum number of courses an instructor can register
-    MaxCoursesPerInstructor,
-    /// Minimum ledger sequences required between course registration and approval
-    MinReviewDelay,
-    /// Default minimum ledger sequences required between enroll() and
-    /// mark_completed() for newly-registered courses (admin-configurable).
-    DefaultMinCompletionLedgers,
-    /// Refund window delay in ledger sequences
-    RefundWindow,
-    /// Refund request record by (student_address, course_id)
-    RefundRequest(Address, String),
-    /// Blocklist of instructor addresses who are frozen
-    InstructorBlocked(Address),
-    /// Ordered list of all registered course IDs (on-chain catalog)
-    CourseList,
-    /// Archived past `Enrollment` records for a (student, course_id) pair,
-    /// preserved when a completed student re-enrolls via `re_enroll()`.
-    EnrollmentHistory(Address, String),
-    /// Aggregate reputation stats for an instructor (total students,
-    /// completions, certificates issued) — see `InstructorStats`.
-    InstructorStats(Address),
-    /// Blocklist of student addresses who are banned from the platform
-    StudentBlocked(Address),
-    /// Per-token fee configuration (maps token address → FeeConfig)
-    FeeConfig(Address),
-    /// Arbitration fee configuration
-    ArbitrationFeeConfig,
-    /// Risk fee configuration for surcharge pricing
-    RiskFeeConfig,
-    /// Flag indicating whether risk-based fee pricing is enabled
-    RiskConfigEnabled,
-    /// Total active enrollments across all courses platform-wide
-    TotalActiveEnrollments,
-    /// Maximum total active enrollments allowed platform-wide
-    PlatformEnrollmentCap,
-    /// A proposed contract Wasm upgrade awaiting its time-lock, if any.
-    PendingUpgrade,
-    /// Configurable time-lock (in ledger sequences) that must elapse
-    /// between an upgrade proposal and its execution.
-    UpgradeTimelock,
-    /// Waitlist for a course - ordered list of student addresses waiting for enrollment
-    CourseWaitlist(String),
-    /// Global registry of all instructor addresses who have registered courses
-    InstructorRegistry,
-    /// Archived course records by course ID, stored to enforce cooldown
-    /// period before the same course ID can be re-registered.
-    ArchivedCourse(String),
-    /// Configurable challenge period (in ledger sequences) after which
-    /// a pending certificate revocation becomes permanent.
-    RevocationChallengePeriod,
-    /// Ordered (append-only) list of certificate IDs issued for a course.
-    /// Populated by `issue_certificate` and consumed by course-wide bulk
-    /// operations such as `bulk_revoke_course_certificates()`.
-    CourseCertificates(String),
-    /// Mapping from enrollment_reference (unique ID) to (student, course_id)
-    /// Used by issue_certificate to look up enrollments without a caller-supplied course_id.
-    EnrollmentByRef(String),
-    /// Counter for generating unique enrollment references
-    EnrollmentRefCounter,
-    /// Global registry of approver addresses with course approval authority
-    Approver(Address),
-    /// Ledger sequence when init() was called — used to enforce
-    /// a governance window before approve_course() can be called.
-    InitLedger,
-    /// Ledger sequence of the last successful transfer_admin() call.
-    /// Used to enforce a minimum cooldown between consecutive admin key
-    /// rotations, preventing rapid-rotation attacks after a compromise.
-    LastAdminTransferLedger,
-    /// Per-course consecutive enrollment failure counter.
-    /// Incremented each time enroll_internal() panics due to a token
-    /// transfer failure for a specific course. Reset to 0 on a successful
-    /// enrollment. When the count reaches CIRCUIT_BREAKER_THRESHOLD the
-    /// course is automatically paused.
-    CourseFailureCount(String),
-    /// Tokens classified as BTC/ETH-denominated for risk-surcharge pricing.
-    BtcEthToken(Address),
-    /// Lifetime enrollment count per student (new-customer risk flag).
-    StudentEnrollmentCount(Address),
+/// Maximum number of variants permitted in a single `#[contracttype]` enum.
+///
+/// Soroban's XDR representation for contract-type enums supports at most 50
+/// variants. `DataKey` has reached that cap, which is why overflow keys live
+/// in `DataKey2` and why new composite keys use standalone key structs (see
+/// `docs/storage-keys.md`).
+pub const DATA_KEY_VARIANT_LIMIT: u32 = 50;
+
+/// Defines a `#[contracttype]` storage-key enum and derives its variant budget.
+///
+/// Keeping the count in a macro (rather than only in a hand-maintained comment)
+/// means adding a variant automatically updates `VARIANT_COUNT`, and the
+/// compile-time assertions after the enum definitions fail the build as soon as
+/// an enum exceeds `DATA_KEY_VARIANT_LIMIT`.
+macro_rules! contract_data_key {
+    (
+        $(#[$enum_meta:meta])*
+        $vis:vis enum $name:ident {
+            $(
+                $(#[$variant_meta:meta])*
+                $variant:ident $(($($variant_ty:tt)*))?
+            ),* $(,)?
+        }
+    ) => {
+        $(#[$enum_meta])*
+        #[contracttype]
+        $vis enum $name {
+            $(
+                $(#[$variant_meta])*
+                $variant $(($($variant_ty)*))?
+            ),*
+        }
+
+        impl $name {
+            /// Exact number of variants in this enum, derived from its definition.
+            pub const VARIANT_COUNT: u32 = 0u32 $(+ {
+                let _ = stringify!($variant);
+                1u32
+            })*;
+
+            /// Maximum number of variants allowed by the XDR encoding.
+            pub const VARIANT_LIMIT: u32 = DATA_KEY_VARIANT_LIMIT;
+
+            /// Number of additional variants that can still be added safely.
+            pub const VARIANT_HEADROOM: u32 =
+                Self::VARIANT_LIMIT.saturating_sub(Self::VARIANT_COUNT);
+        }
+    };
 }
 
-/// Overflow keys split out to avoid the #[contracttype] variant-count limit.
+contract_data_key! {
+    pub enum DataKey {
+        /// Course record by course ID
+        Course(String),
+        /// Immutable instructor address recorded at registration time
+        CourseInstructorRef(String),
+        /// Enrollment record by (student_address, course_id)
+        Enrollment(Address, String),
+        /// Certificate record by certificate ID
+        Certificate(String),
+        /// Admin address — set at init, can approve courses and issue certificates
+        Admin,
+        /// Secondary admin address for multi-sig operations
+        SecondaryAdmin,
+        /// Optional ledger sequence when the admin role expires
+        AdminExpiresAt,
+        /// Platform treasury address — receives the platform fee share
+        Treasury,
+        /// Platform default fee percentage (overrideable per course)
+        DefaultFee,
+        /// Pending platform treasury address and effective ledger sequence
+        PendingTreasury,
+        /// Whitelisted token contract address (used to validate course tokens)
+        ApprovedToken(Address),
+        /// Pending new admin address — must call accept_admin() to take effect
+        PendingAdmin,
+        /// Pending new secondary admin address
+        PendingSecondaryAdmin,
+        /// Platform paused state flag
+        PlatformPaused,
+        /// Accumulated instructor earnings per (instructor, token) pair (in stroops)
+        InstructorEarnings(Address, Address),
+        /// Accumulated instructor earnings across all tokens (in stroops)
+        InstructorTotalEarnings(Address),
+        /// Number of courses registered by an instructor
+        InstructorCourseCount(Address),
+        /// Number of currently pending courses for an instructor
+        InstructorPendingCourseCount(Address),
+        /// Ordered list of course IDs registered by a specific instructor
+        /// (append-only — course status changes never remove an entry).
+        InstructorCourseList(Address),
+        /// Maximum number of courses an instructor can register
+        MaxCoursesPerInstructor,
+        /// Minimum ledger sequences required between course registration and approval
+        MinReviewDelay,
+        /// Default minimum ledger sequences required between enroll() and
+        /// mark_completed() for newly-registered courses (admin-configurable).
+        DefaultMinCompletionLedgers,
+        /// Refund window delay in ledger sequences
+        RefundWindow,
+        /// Refund request record by (student_address, course_id)
+        RefundRequest(Address, String),
+        /// Blocklist of instructor addresses who are frozen
+        InstructorBlocked(Address),
+        /// Ordered list of all registered course IDs (on-chain catalog)
+        CourseList,
+        /// Archived past `Enrollment` records for a (student, course_id) pair,
+        /// preserved when a completed student re-enrolls via `re_enroll()`.
+        EnrollmentHistory(Address, String),
+        /// Aggregate reputation stats for an instructor (total students,
+        /// completions, certificates issued) — see `InstructorStats`.
+        InstructorStats(Address),
+        /// Blocklist of student addresses who are banned from the platform
+        StudentBlocked(Address),
+        /// Per-token fee configuration (maps token address → FeeConfig)
+        FeeConfig(Address),
+        /// Arbitration fee configuration
+        ArbitrationFeeConfig,
+        /// Risk fee configuration for surcharge pricing
+        RiskFeeConfig,
+        /// Flag indicating whether risk-based fee pricing is enabled
+        RiskConfigEnabled,
+        /// Total active enrollments across all courses platform-wide
+        TotalActiveEnrollments,
+        /// Maximum total active enrollments allowed platform-wide
+        PlatformEnrollmentCap,
+        /// A proposed contract Wasm upgrade awaiting its time-lock, if any.
+        PendingUpgrade,
+        /// Configurable time-lock (in ledger sequences) that must elapse
+        /// between an upgrade proposal and its execution.
+        UpgradeTimelock,
+        /// Waitlist for a course - ordered list of student addresses waiting for enrollment
+        CourseWaitlist(String),
+        /// Global registry of all instructor addresses who have registered courses
+        InstructorRegistry,
+        /// Archived course records by course ID, stored to enforce cooldown
+        /// period before the same course ID can be re-registered.
+        ArchivedCourse(String),
+        /// Configurable challenge period (in ledger sequences) after which
+        /// a pending certificate revocation becomes permanent.
+        RevocationChallengePeriod,
+        /// Ordered (append-only) list of certificate IDs issued for a course.
+        /// Populated by `issue_certificate` and consumed by course-wide bulk
+        /// operations such as `bulk_revoke_course_certificates()`.
+        CourseCertificates(String),
+        /// Mapping from enrollment_reference (unique ID) to (student, course_id)
+        /// Used by issue_certificate to look up enrollments without a caller-supplied course_id.
+        EnrollmentByRef(String),
+        /// Counter for generating unique enrollment references
+        EnrollmentRefCounter,
+        /// Global registry of approver addresses with course approval authority
+        Approver(Address),
+        /// Ledger sequence when init() was called — used to enforce
+        /// a governance window before approve_course() can be called.
+        InitLedger,
+        /// Ledger sequence of the last successful transfer_admin() call.
+        /// Used to enforce a minimum cooldown between consecutive admin key
+        /// rotations, preventing rapid-rotation attacks after a compromise.
+        LastAdminTransferLedger,
+        /// Per-course consecutive enrollment failure counter.
+        /// Incremented each time enroll_internal() panics due to a token
+        /// transfer failure for a specific course. Reset to 0 on a successful
+        /// enrollment. When the count reaches CIRCUIT_BREAKER_THRESHOLD the
+        /// course is automatically paused.
+        CourseFailureCount(String),
+        /// Tokens classified as BTC/ETH-denominated for risk-surcharge pricing.
+        BtcEthToken(Address),
+        /// Lifetime enrollment count per student (new-customer risk flag).
+        StudentEnrollmentCount(Address),
+    }
+}
+
+contract_data_key! {
+    /// Overflow keys split out to avoid the #[contracttype] variant-count limit.
+    pub enum DataKey2 {
+        /// Threshold price (in stroops) above which a course is "high-value"
+        /// and requires co-signature from two different admins to approve
+        HighValueCourseThreshold,
+        /// Stores the first approver's address for a high-value course pending co-signature
+        HighValueCourseApproval(String),
+        /// Append-only list of caller addresses that have opened an arbitration
+        /// case for a course. Preserved after resolution so the full dispute
+        /// history for the course remains enumerable.
+        CourseArbitrationCases(String),
+        /// Append-only list of course IDs for which a student has opened an
+        /// arbitration case. Preserved after resolution.
+        StudentArbitrationCases(Address),
+        /// Wasm hash installed by the most recent `upgrade_contract` call.
+        /// Absent until the first upgrade executes, since the host does not
+        /// expose the currently running Wasm hash to the contract.
+        CurrentWasmHash,
+        /// Storage schema version that persisted/instance records are known to
+        /// conform to. Absent means `STORAGE_SCHEMA_VERSION_INITIAL`. Advanced
+        /// only by `migrate()`.
+        StorageSchemaVersion,
+    }
+}
+
+// Fail the build as soon as either storage-key enum outgrows its XDR budget.
+const _: () = assert!(DataKey::VARIANT_COUNT <= DATA_KEY_VARIANT_LIMIT);
+const _: () = assert!(DataKey2::VARIANT_COUNT <= DATA_KEY_VARIANT_LIMIT);
+
+/// Direct-lookup key recording that an instructor is already listed in
+/// `DataKey::InstructorRegistry`. Lets `register_course` answer "is this
+/// instructor new?" without scanning the registry Vec. Stored as a standalone
+/// key so it does not use up `DataKey`'s 50-variant budget.
 #[contracttype]
-pub enum DataKey2 {
-    /// Threshold price (in stroops) above which a course is "high-value"
-    /// and requires co-signature from two different admins to approve
-    HighValueCourseThreshold,
-    /// Stores the first approver's address for a high-value course pending co-signature
-    HighValueCourseApproval(String),
-    /// Wasm hash installed by the most recent `upgrade_contract` call.
-    /// Absent until the first upgrade executes, since the host does not
-    /// expose the currently running Wasm hash to the contract.
-    CurrentWasmHash,
-    /// Storage schema version that persisted/instance records are known to
-    /// conform to. Absent means `STORAGE_SCHEMA_VERSION_INITIAL`. Advanced
-    /// only by `migrate()`.
-    StorageSchemaVersion,
+#[derive(Clone, Debug)]
+pub struct InstructorRegisteredKey {
+    pub instructor: Address,
 }
 
 /// A proposed contract code upgrade awaiting its governance time-lock.
@@ -625,6 +819,11 @@ impl SorobanLardContract {
     /// Minimum ledgers before persistent storage TTL extension is triggered (~1 year)
     pub(crate) const PERSISTENT_TTL_THRESHOLD: u32 = 6_000_000;
     pub(crate) const PERSISTENT_TTL_EXTEND_TO: u32 = 6_300_000;
+    /// Semantic version of the deployed contract code, exposed on-chain via
+    /// `get_contract_version()` so off-chain consumers can detect upgrades.
+    /// Bump on every change to a public function signature or event payload
+    /// (see "Contract Versioning" in the README).
+    pub(crate) const CONTRACT_VERSION: &'static str = "0.1.0";
     const MAX_COURSE_ID_LEN: u32 = 256;
     const MAX_COURSE_TITLE_LEN: u32 = 512;
     /// Minimum non-zero course price accepted at registration, denominated
@@ -649,6 +848,13 @@ impl SorobanLardContract {
     /// `run_migration_step`) whenever a release changes the shape of any
     /// stored `#[contracttype]` record.
     pub(crate) const STORAGE_SCHEMA_VERSION: u32 = 1;
+    /// Hard floor for the upgrade governance time-lock, in ledger sequences
+    /// (~17,280 ledgers ≈ 1 day at 5s/ledger). `set_upgrade_timelock` rejects
+    /// any lower value so a compromised admin pair cannot shrink the review
+    /// window to zero and push a malicious upgrade through immediately.
+    /// Mainnet deployments should configure a longer window — see the
+    /// "Upgrade Time-Lock Guidance" section of the README.
+    pub(crate) const MIN_UPGRADE_TIMELOCK_LEDGERS: u32 = 17_280;
     /// Cooldown period in ledger sequences after a course is archived
     /// before the same course ID can be re-registered. This prevents
     /// confusion where a new course inherits the identity of an archived
@@ -663,6 +869,13 @@ impl SorobanLardContract {
     /// Maximum number of course IDs returned by a single `list_courses()` call.
     /// Larger catalogs must be walked with successive `offset` values so one
     /// invocation cannot exceed the transaction CPU/instruction budget.
+    ///
+    /// Rationale: `list_courses()` returns `String` IDs, not full `Course`
+    /// structs, so the limit bounds the response size and per-ID clone work.
+    /// It does not bound the read cost: the whole `CourseList` vector is
+    /// loaded on every call, so that cost grows with catalog size. The value
+    /// 50 has no benchmark behind it yet. Re-evaluate it if `list_courses()`
+    /// ever returns full `Course` records (`Course` has 23 fields today).
     pub(crate) const MAX_PAGE_SIZE: u32 = 50;
     /// Maximum number of students that may be refunded in a single
     /// `archive_course()` call. Large courses must be refunded in multiple
@@ -680,6 +893,12 @@ impl SorobanLardContract {
     const MAX_CATEGORIES: u32 = 10;
     /// Maximum length of a category name in characters (#165)
     const MAX_CATEGORY_LEN: u32 = 64;
+    /// Ledgers an arbitration case may remain `Open` before the arbitration
+    /// fee can be permissionlessly refunded to the escalating party. This is
+    /// the admin-resolution SLA: after this many ledgers of inactivity the
+    /// case can no longer be resolved by an admin and must be auto-refunded
+    /// instead (~17,280 ledgers ≈ 1 day at 5s/ledger).
+    pub(crate) const ARBITRATION_TIMEOUT_LEDGERS: u32 = 17_280;
 
     // ----------------------------------------------------------
     // INIT
@@ -690,11 +909,17 @@ impl SorobanLardContract {
     ///
     /// # Arguments
     /// - `admin`                    — admin address (approves courses, issues certificates)
+    /// - `secondary_admin`          — second admin required for multi-sig operations
     /// - `treasury`                 — platform treasury address (receives platform fee share)
     /// - `default_fee_pct`          — default platform fee percentage (e.g. 20 = 20%)
     /// - `refund_window_ledgers`    — number of ledger sequences after enrollment during which a
     ///                                refund request is accepted; requests after this window are
     ///                                automatically rejected (e.g. 17_280 ≈ 1 day at 5s/ledger)
+    ///
+    /// # Panics
+    /// - If `admin`, `secondary_admin` or `treasury` is the contract's own
+    ///   address (#137)
+    /// - If any two of `admin`, `secondary_admin` and `treasury` are equal
     pub fn init(
         env: Env,
         admin: Address,
@@ -715,8 +940,22 @@ impl SorobanLardContract {
             panic!("fee percentage cannot exceed 100");
         }
 
-        if treasury == env.current_contract_address() {
+        // The contract must never be configured as one of its own privileged
+        // or fee-receiving addresses: a contract-owned admin would make
+        // `require_auth()` checks satisfiable by the contract itself, and a
+        // contract-owned treasury would trap platform fees. (#137)
+        let contract_address = env.current_contract_address();
+
+        if treasury == contract_address {
             panic!("treasury cannot be the contract address");
+        }
+
+        if admin == contract_address {
+            panic!("admin cannot be the contract address");
+        }
+
+        if secondary_admin == contract_address {
+            panic!("secondary_admin cannot be the contract address");
         }
 
         if admin == treasury {
@@ -803,11 +1042,7 @@ impl SorobanLardContract {
         env.storage()
             .persistent()
             .set(&DataKey::Course(course_id.clone()), &course);
-        env.storage().persistent().extend_ttl(
-            &DataKey::Course(course_id.clone()),
-            Self::PERSISTENT_TTL_THRESHOLD,
-            Self::PERSISTENT_TTL_EXTEND_TO,
-        );
+        Self::extend_persistent_ttl(&env, &DataKey::Course(course_id.clone()));
 
         env.events().publish(
             (Symbol::new(&env, "enrollment_start_set"), course_id.clone()),
@@ -959,6 +1194,8 @@ impl SorobanLardContract {
 
         let course_count_key = DataKey::InstructorCourseCount(instructor.clone());
         let current_count: u32 = env.storage().instance().get(&course_count_key).unwrap_or(0);
+        // Used below to recognise instructors who predate `InstructorRegisteredKey`.
+        let had_course_count = env.storage().instance().has(&course_count_key);
 
         if current_count >= max_courses {
             panic!("instructor has reached the maximum number of course registrations");
@@ -1029,25 +1266,15 @@ impl SorobanLardContract {
             categories,
         };
 
+        let course_key = DataKey::Course(course_id.clone());
+        env.storage().persistent().set(&course_key, &course);
+        Self::extend_persistent_ttl(&env, &course_key);
+
+        let instructor_ref_key = DataKey::CourseInstructorRef(course_id.clone());
         env.storage()
             .persistent()
-            .set(&DataKey::Course(course_id.clone()), &course);
-
-        env.storage().persistent().extend_ttl(
-            &DataKey::Course(course_id.clone()),
-            Self::PERSISTENT_TTL_THRESHOLD,
-            Self::PERSISTENT_TTL_EXTEND_TO,
-        );
-
-        env.storage().persistent().set(
-            &DataKey::CourseInstructorRef(course_id.clone()),
-            &instructor,
-        );
-        env.storage().persistent().extend_ttl(
-            &DataKey::CourseInstructorRef(course_id.clone()),
-            Self::PERSISTENT_TTL_THRESHOLD,
-            Self::PERSISTENT_TTL_EXTEND_TO,
-        );
+            .set(&instructor_ref_key, &instructor);
+        Self::extend_persistent_ttl(&env, &instructor_ref_key);
 
         // Append to on-chain course catalog
         let mut catalog: Vec<String> = env
@@ -1059,16 +1286,11 @@ impl SorobanLardContract {
         env.storage()
             .persistent()
             .set(&DataKey::CourseList, &catalog);
-        env.storage().persistent().extend_ttl(
-            &DataKey::CourseList,
-            Self::PERSISTENT_TTL_THRESHOLD,
-            Self::PERSISTENT_TTL_EXTEND_TO,
-        );
+        Self::extend_persistent_ttl(&env, &DataKey::CourseList);
 
-        env.storage().instance().set(
-            &DataKey::InstructorCourseCount(instructor.clone()),
-            &(current_count + 1),
-        );
+        env.storage()
+            .instance()
+            .set(&course_count_key, &(current_count + 1));
         env.storage()
             .instance()
             .set(&pending_count_key, &(current_pending_count + 1));
@@ -1084,38 +1306,45 @@ impl SorobanLardContract {
         env.storage()
             .persistent()
             .set(&instructor_list_key, &instructor_courses);
-        env.storage().persistent().extend_ttl(
-            &instructor_list_key,
-            Self::PERSISTENT_TTL_THRESHOLD,
-            Self::PERSISTENT_TTL_EXTEND_TO,
-        );
+        Self::extend_persistent_ttl(&env, &instructor_list_key);
 
-        // Add instructor to global registry if first course
-        let mut registry: Vec<Address> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::InstructorRegistry)
-            .unwrap_or_else(|| Vec::new(&env));
-
-        // Check if instructor already exists in registry
-        let mut exists = false;
-        for i in 0..registry.len() {
-            if registry.get(i).unwrap() == instructor {
-                exists = true;
-                break;
-            }
-        }
-
-        if !exists {
-            registry.push_back(instructor.clone());
-            env.storage()
+        // Add the instructor to the global registry on their first course.
+        // Membership is recorded under a direct-lookup key, so repeat
+        // instructors never load the registry Vec and new ones are not
+        // checked by scanning it.
+        let registered_key = InstructorRegisteredKey {
+            instructor: instructor.clone(),
+        };
+        if !env.storage().persistent().has(&registered_key) {
+            let mut registry: Vec<Address> = env
+                .storage()
                 .persistent()
-                .set(&DataKey::InstructorRegistry, &registry);
-            env.storage().persistent().extend_ttl(
-                &DataKey::InstructorRegistry,
-                Self::PERSISTENT_TTL_THRESHOLD,
-                Self::PERSISTENT_TTL_EXTEND_TO,
-            );
+                .get(&DataKey::InstructorRegistry)
+                .unwrap_or_else(|| Vec::new(&env));
+
+            // An instructor with a course count but no key is either from
+            // before this key existed or was a transferee. Scan the Vec only
+            // for them, so an upgraded contract never lists anyone twice.
+            let mut already_listed = false;
+            if had_course_count {
+                for i in 0..registry.len() {
+                    if registry.get(i).unwrap() == instructor {
+                        already_listed = true;
+                        break;
+                    }
+                }
+            }
+
+            if !already_listed {
+                registry.push_back(instructor.clone());
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::InstructorRegistry, &registry);
+                Self::extend_persistent_ttl(&env, &DataKey::InstructorRegistry);
+            }
+
+            env.storage().persistent().set(&registered_key, &true);
+            Self::extend_persistent_ttl(&env, &registered_key);
         }
 
         env.events().publish(
@@ -1193,8 +1422,7 @@ impl SorobanLardContract {
         if let Some(threshold_val) = threshold {
             if course.price >= threshold_val {
                 let approval_key = DataKey2::HighValueCourseApproval(course_id.clone());
-                let prior_approver: Option<Address> =
-                    env.storage().instance().get(&approval_key);
+                let prior_approver: Option<Address> = env.storage().instance().get(&approval_key);
                 match prior_approver {
                     None => {
                         // Record first approval and return — need a second admin
@@ -1217,11 +1445,7 @@ impl SorobanLardContract {
         env.storage()
             .persistent()
             .set(&DataKey::Course(course_id.clone()), &course);
-        env.storage().persistent().extend_ttl(
-            &DataKey::Course(course_id.clone()),
-            Self::PERSISTENT_TTL_THRESHOLD,
-            Self::PERSISTENT_TTL_EXTEND_TO,
-        );
+        Self::extend_persistent_ttl(&env, &DataKey::Course(course_id.clone()));
 
         let pending_key = DataKey::InstructorPendingCourseCount(course.instructor.clone());
         let pending_count: u32 = env.storage().instance().get(&pending_key).unwrap_or(0);
@@ -1285,11 +1509,7 @@ impl SorobanLardContract {
         env.storage()
             .persistent()
             .set(&DataKey::Course(course_id.clone()), &course);
-        env.storage().persistent().extend_ttl(
-            &DataKey::Course(course_id.clone()),
-            Self::PERSISTENT_TTL_THRESHOLD,
-            Self::PERSISTENT_TTL_EXTEND_TO,
-        );
+        Self::extend_persistent_ttl(&env, &DataKey::Course(course_id.clone()));
 
         env.events().publish(
             (Symbol::new(&env, "course_rejected"), course_id.clone()),
@@ -1332,11 +1552,7 @@ impl SorobanLardContract {
         env.storage()
             .persistent()
             .set(&DataKey::Course(course_id.clone()), &course);
-        env.storage().persistent().extend_ttl(
-            &DataKey::Course(course_id.clone()),
-            Self::PERSISTENT_TTL_THRESHOLD,
-            Self::PERSISTENT_TTL_EXTEND_TO,
-        );
+        Self::extend_persistent_ttl(&env, &DataKey::Course(course_id.clone()));
 
         env.events().publish(
             (Symbol::new(&env, "course_paused"), course_id.clone()),
@@ -1382,11 +1598,7 @@ impl SorobanLardContract {
         env.storage()
             .persistent()
             .set(&DataKey::Course(course_id.clone()), &course);
-        env.storage().persistent().extend_ttl(
-            &DataKey::Course(course_id.clone()),
-            Self::PERSISTENT_TTL_THRESHOLD,
-            Self::PERSISTENT_TTL_EXTEND_TO,
-        );
+        Self::extend_persistent_ttl(&env, &DataKey::Course(course_id.clone()));
 
         env.events().publish(
             (Symbol::new(&env, "course_unpaused"), course_id.clone()),
@@ -1470,30 +1682,22 @@ impl SorobanLardContract {
             }
         }
 
-        let previous_instructor = course.instructor.clone();
+        // Swap in the new owner and keep the previous one, so no clone is needed.
+        let previous_instructor =
+            core::mem::replace(&mut course.instructor, new_instructor.clone());
 
-        course.instructor = new_instructor.clone();
         course.last_updated_ledger = env.ledger().sequence();
-        env.storage()
-            .persistent()
-            .set(&DataKey::Course(course_id.clone()), &course);
-        env.storage().persistent().extend_ttl(
-            &DataKey::Course(course_id.clone()),
-            Self::PERSISTENT_TTL_THRESHOLD,
-            Self::PERSISTENT_TTL_EXTEND_TO,
-        );
+        let course_key = DataKey::Course(course_id.clone());
+        env.storage().persistent().set(&course_key, &course);
+        Self::extend_persistent_ttl(&env, &course_key);
 
         // Keep CourseInstructorRef in sync so enroll() continues to succeed
         // after ownership changes. Enrollment records themselves are untouched.
-        env.storage().persistent().set(
-            &DataKey::CourseInstructorRef(course_id.clone()),
-            &new_instructor,
-        );
-        env.storage().persistent().extend_ttl(
-            &DataKey::CourseInstructorRef(course_id.clone()),
-            Self::PERSISTENT_TTL_THRESHOLD,
-            Self::PERSISTENT_TTL_EXTEND_TO,
-        );
+        let instructor_ref_key = DataKey::CourseInstructorRef(course_id.clone());
+        env.storage()
+            .persistent()
+            .set(&instructor_ref_key, &new_instructor);
+        Self::extend_persistent_ttl(&env, &instructor_ref_key);
 
         let old_count_key = DataKey::InstructorCourseCount(previous_instructor.clone());
         let old_count: u32 = env.storage().instance().get(&old_count_key).unwrap_or(0);
@@ -1538,11 +1742,7 @@ impl SorobanLardContract {
         env.storage()
             .persistent()
             .set(&new_list_key, &new_instructor_courses);
-        env.storage().persistent().extend_ttl(
-            &new_list_key,
-            Self::PERSISTENT_TTL_THRESHOLD,
-            Self::PERSISTENT_TTL_EXTEND_TO,
-        );
+        Self::extend_persistent_ttl(&env, &new_list_key);
 
         env.events().publish(
             (Symbol::new(&env, "course_transferred"), course_id.clone()),
@@ -1647,11 +1847,7 @@ impl SorobanLardContract {
                             .unwrap_or_else(|| Vec::new(&env));
                         history.push_back(archived_enrollment);
                         env.storage().persistent().set(&history_key, &history);
-                        env.storage().persistent().extend_ttl(
-                            &history_key,
-                            Self::PERSISTENT_TTL_THRESHOLD,
-                            Self::PERSISTENT_TTL_EXTEND_TO,
-                        );
+                        Self::extend_persistent_ttl(&env, &history_key);
 
                         env.storage().persistent().remove(&enrollment_key);
 
@@ -1690,11 +1886,7 @@ impl SorobanLardContract {
             env.storage()
                 .persistent()
                 .set(&DataKey::Course(course_id.clone()), &course);
-            env.storage().persistent().extend_ttl(
-                &DataKey::Course(course_id.clone()),
-                Self::PERSISTENT_TTL_THRESHOLD,
-                Self::PERSISTENT_TTL_EXTEND_TO,
-            );
+            Self::extend_persistent_ttl(&env, &DataKey::Course(course_id.clone()));
             return;
         }
 
@@ -1918,11 +2110,7 @@ impl SorobanLardContract {
         env.storage()
             .persistent()
             .set(&DataKey::Course(course_id.clone()), &course);
-        env.storage().persistent().extend_ttl(
-            &DataKey::Course(course_id.clone()),
-            Self::PERSISTENT_TTL_THRESHOLD,
-            Self::PERSISTENT_TTL_EXTEND_TO,
-        );
+        Self::extend_persistent_ttl(&env, &DataKey::Course(course_id.clone()));
 
         env.events().publish(
             (Symbol::new(&env, "course_expiry_set"), course_id.clone()),
@@ -1987,11 +2175,7 @@ impl SorobanLardContract {
         env.storage()
             .persistent()
             .set(&DataKey::Course(course_id.clone()), &course);
-        env.storage().persistent().extend_ttl(
-            &DataKey::Course(course_id.clone()),
-            Self::PERSISTENT_TTL_THRESHOLD,
-            Self::PERSISTENT_TTL_EXTEND_TO,
-        );
+        Self::extend_persistent_ttl(&env, &DataKey::Course(course_id.clone()));
 
         env.events().publish(
             (
@@ -2045,11 +2229,7 @@ impl SorobanLardContract {
         env.storage()
             .persistent()
             .set(&DataKey::Course(course_id.clone()), &course);
-        env.storage().persistent().extend_ttl(
-            &DataKey::Course(course_id.clone()),
-            Self::PERSISTENT_TTL_THRESHOLD,
-            Self::PERSISTENT_TTL_EXTEND_TO,
-        );
+        Self::extend_persistent_ttl(&env, &DataKey::Course(course_id.clone()));
 
         env.events().publish(
             (Symbol::new(&env, "content_hash_updated"), course_id.clone()),
@@ -2108,11 +2288,7 @@ impl SorobanLardContract {
         env.storage()
             .persistent()
             .set(&DataKey::Course(course_id.clone()), &course);
-        env.storage().persistent().extend_ttl(
-            &DataKey::Course(course_id.clone()),
-            Self::PERSISTENT_TTL_THRESHOLD,
-            Self::PERSISTENT_TTL_EXTEND_TO,
-        );
+        Self::extend_persistent_ttl(&env, &DataKey::Course(course_id.clone()));
 
         env.events().publish(
             (Symbol::new(&env, "max_certificates_set"), course_id.clone()),
@@ -2131,6 +2307,18 @@ impl SorobanLardContract {
     ///   - Instructor fee → credited to instructor earnings (withdraw via withdraw_earnings)
     ///
     /// A student cannot enroll in the same course twice.
+    ///
+    /// # Free (zero-price) courses (#131)
+    /// A course price of exactly `0` is a supported case. The payment split
+    /// never divides by the price — the platform fee is computed as
+    /// `price * fee_bps / 10_000` — and `deduct_fee()` short-circuits to
+    /// `(0, 0)` for a non-positive amount. `enroll_internal()` additionally
+    /// skips the whole token-transfer block when `price == 0`, so no token
+    /// call is made, the student needs no balance, the treasury and
+    /// instructor earnings are untouched, and the enrollment is recorded
+    /// with `amount_paid`, `platform_amount` and `instructor_amount` all
+    /// equal to `0`. Any per-token fee, course fee override or risk
+    /// surcharge has no effect on a free course.
     ///
     /// # Arguments
     /// - `student`   — student's Stellar address (must sign)
@@ -2178,10 +2366,12 @@ impl SorobanLardContract {
             seen.set(id, true);
         }
 
-        // Validate every course before any mutation
+        // Validate every course before any mutation. Each validated Course
+        // is kept so the enroll pass below does not read it from storage again.
+        let mut validated: Vec<Course> = Vec::new(&env);
         for i in 0..course_ids.len() {
             let course_id = course_ids.get(i).unwrap();
-            Self::validate_enrollment(&env, &student, &course_id);
+            validated.push_back(Self::validate_enrollment(&env, &student, &course_id));
         }
 
         // All validations passed — enroll atomically using the validated
@@ -2189,11 +2379,14 @@ impl SorobanLardContract {
         // enroll_internal().
         for i in 0..course_ids.len() {
             let course_id = course_ids.get(i).unwrap();
-            Self::enroll_internal_validated(&env, &student, &course_id);
+            let course = validated.get(i).unwrap();
+            Self::enroll_internal_validated(&env, &student, &course_id, course);
         }
     }
 
-    fn validate_enrollment(env: &Env, student: &Address, course_id: &String) {
+    /// Run every enrollment guard for `student` in `course_id` and return the
+    /// Course that was checked, so callers can reuse it without another read.
+    fn validate_enrollment(env: &Env, student: &Address, course_id: &String) -> Course {
         if env
             .storage()
             .instance()
@@ -2344,13 +2537,12 @@ impl SorobanLardContract {
                 panic!("platform has reached maximum total enrollment capacity");
             }
         }
+
+        course
     }
 
     fn enroll_internal(env: &Env, student: &Address, course_id: &String) {
-        Self::validate_enrollment(env, student, course_id);
-
-        let mut course =
-            Self::get_course_internal(env, course_id).unwrap_or_else(|| panic!("course not found"));
+        let mut course = Self::validate_enrollment(env, student, course_id);
         let token_client = token::Client::new(env, &course.token);
 
         // #178 — Circuit breaker early-exit: if a prior failed invocation has already
@@ -2368,11 +2560,7 @@ impl SorobanLardContract {
             env.storage()
                 .persistent()
                 .set(&DataKey::Course(course_id.clone()), &course);
-            env.storage().persistent().extend_ttl(
-                &DataKey::Course(course_id.clone()),
-                Self::PERSISTENT_TTL_THRESHOLD,
-                Self::PERSISTENT_TTL_EXTEND_TO,
-            );
+            Self::extend_persistent_ttl(env, &DataKey::Course(course_id.clone()));
             env.events().publish(
                 (
                     Symbol::new(env, "course_circuit_breaker_tripped"),
@@ -2418,12 +2606,11 @@ impl SorobanLardContract {
         // Risk flags come from the same helper the fee previews use, so a
         // quote from get_effective_fee_for_payment() matches this charge.
         let (is_new_customer, is_btc_eth) = Self::resolve_risk_flags(env, student, &course.token);
-        let course_fee_override_bps = Self::course_fee_override_bps(env, &course.id);
         let (instructor_amount, platform_amount) = Self::deduct_fee(
             env,
             &course.token,
             course.price,
-            Self::course_fee_override_bps(env, course_id),
+            Self::course_fee_override_bps(&course),
             is_new_customer,
             is_btc_eth,
         );
@@ -2470,12 +2657,12 @@ impl SorobanLardContract {
         env.storage()
             .persistent()
             .set(&failure_key, &new_failure_count);
-        env.storage().persistent().extend_ttl(
-            &failure_key,
-            Self::PERSISTENT_TTL_THRESHOLD,
-            Self::PERSISTENT_TTL_EXTEND_TO,
-        );
+        Self::extend_persistent_ttl(env, &failure_key);
 
+        // Zero-price (free) courses skip this block entirely (#131): no
+        // token transfer, balance check, fee distribution or earnings credit
+        // takes place, and `platform_amount`/`instructor_amount` are already
+        // `(0, 0)` because `deduct_fee()` short-circuits on a zero amount.
         let actual_amount_paid = if course.price > 0 {
             // Verify actual transfer amount by checking balance before and after
             let balance_before = token_client.balance(&env.current_contract_address());
@@ -2537,11 +2724,7 @@ impl SorobanLardContract {
         // this success can still proceed (the course status check in
         // validate_enrollment would have rejected it if it were Paused).
         env.storage().persistent().set(&failure_key, &0u32);
-        env.storage().persistent().extend_ttl(
-            &failure_key,
-            Self::PERSISTENT_TTL_THRESHOLD,
-            Self::PERSISTENT_TTL_EXTEND_TO,
-        );
+        Self::extend_persistent_ttl(env, &failure_key);
 
         // If the pre-incremented failure count hit the threshold (meaning this
         // successful call was preceded by CIRCUIT_BREAKER_THRESHOLD-1 failures),
@@ -2560,11 +2743,7 @@ impl SorobanLardContract {
             env.storage()
                 .persistent()
                 .set(&DataKey::Course(course_id.clone()), &course);
-            env.storage().persistent().extend_ttl(
-                &DataKey::Course(course_id.clone()),
-                Self::PERSISTENT_TTL_THRESHOLD,
-                Self::PERSISTENT_TTL_EXTEND_TO,
-            );
+            Self::extend_persistent_ttl(env, &DataKey::Course(course_id.clone()));
             env.events().publish(
                 (
                     Symbol::new(&env, "course_circuit_breaker_tripped"),
@@ -2602,11 +2781,7 @@ impl SorobanLardContract {
             &enrollment,
         );
 
-        env.storage().persistent().extend_ttl(
-            &DataKey::Enrollment(student.clone(), course_id.clone()),
-            Self::PERSISTENT_TTL_THRESHOLD,
-            Self::PERSISTENT_TTL_EXTEND_TO,
-        );
+        Self::extend_persistent_ttl(env, &DataKey::Enrollment(student.clone(), course_id.clone()));
 
         // Update course stats
         course.total_enrollments = course
@@ -2671,11 +2846,15 @@ impl SorobanLardContract {
     /// # Safety
     ///
     /// Callers must ensure `validate_enrollment()` was already called for
-    /// this `(student, course_id)` pair in the same transaction. Direct
-    /// external callers must use `enroll_internal()` instead.
-    fn enroll_internal_validated(env: &Env, student: &Address, course_id: &String) {
-        let mut course =
-            Self::get_course_internal(env, course_id).unwrap_or_else(|| panic!("course not found"));
+    /// this `(student, course_id)` pair in the same transaction, and pass in
+    /// the Course it returned. Direct external callers must use
+    /// `enroll_internal()` instead.
+    fn enroll_internal_validated(
+        env: &Env,
+        student: &Address,
+        course_id: &String,
+        mut course: Course,
+    ) {
         let token_client = token::Client::new(env, &course.token);
 
         if course.status != CourseStatus::Active {
@@ -2691,12 +2870,11 @@ impl SorobanLardContract {
             panic!("course is not available for enrollment");
         }
 
-        let course_fee_override_bps = Self::course_fee_override_bps(env, &course.id);
         let (instructor_amount, platform_amount) = Self::deduct_fee(
             env,
             &course.token,
             course.price,
-            Self::course_fee_override_bps(env, course_id),
+            Self::course_fee_override_bps(&course),
             false,
             false,
         );
@@ -2794,11 +2972,7 @@ impl SorobanLardContract {
             &enrollment,
         );
 
-        env.storage().persistent().extend_ttl(
-            &DataKey::Enrollment(student.clone(), course_id.clone()),
-            Self::PERSISTENT_TTL_THRESHOLD,
-            Self::PERSISTENT_TTL_EXTEND_TO,
-        );
+        Self::extend_persistent_ttl(env, &DataKey::Enrollment(student.clone(), course_id.clone()));
 
         course.total_enrollments = course
             .total_enrollments
@@ -2933,11 +3107,7 @@ impl SorobanLardContract {
             .unwrap_or_else(|| Vec::new(&env));
         history.push_back(previous_enrollment);
         env.storage().persistent().set(&history_key, &history);
-        env.storage().persistent().extend_ttl(
-            &history_key,
-            Self::PERSISTENT_TTL_THRESHOLD,
-            Self::PERSISTENT_TTL_EXTEND_TO,
-        );
+        Self::extend_persistent_ttl(&env, &history_key);
 
         let token_client = token::Client::new(&env, &course.token);
 
@@ -2946,12 +3116,11 @@ impl SorobanLardContract {
         // 2. Risk-based surcharges for large payments, new customers, and BTC/ETH
         // 3. Publishes RiskFeeApplied event when surcharge applies
         let (is_new_customer, is_btc_eth) = Self::resolve_risk_flags(&env, &student, &course.token);
-        let course_fee_override_bps = Self::course_fee_override_bps(&env, &course.id);
         let (instructor_amount, platform_amount) = Self::deduct_fee(
             &env,
             &course.token,
             course.price,
-            Self::course_fee_override_bps(&env, &course_id),
+            Self::course_fee_override_bps(&course),
             is_new_customer,
             is_btc_eth,
         );
@@ -3026,11 +3195,7 @@ impl SorobanLardContract {
         env.storage()
             .persistent()
             .set(&enrollment_key, &new_enrollment);
-        env.storage().persistent().extend_ttl(
-            &enrollment_key,
-            Self::PERSISTENT_TTL_THRESHOLD,
-            Self::PERSISTENT_TTL_EXTEND_TO,
-        );
+        Self::extend_persistent_ttl(&env, &enrollment_key);
 
         course.total_enrollments = course
             .total_enrollments
@@ -3235,11 +3400,7 @@ impl SorobanLardContract {
             &DataKey::Enrollment(student.clone(), course_id.clone()),
             &enrollment,
         );
-        env.storage().persistent().extend_ttl(
-            &DataKey::Enrollment(student.clone(), course_id.clone()),
-            Self::PERSISTENT_TTL_THRESHOLD,
-            Self::PERSISTENT_TTL_EXTEND_TO,
-        );
+        Self::extend_persistent_ttl(&env, &DataKey::Enrollment(student.clone(), course_id.clone()));
 
         // Update active enrollments count on course
         let mut course = Self::get_course_internal(&env, &course_id)
@@ -3250,11 +3411,7 @@ impl SorobanLardContract {
             env.storage()
                 .persistent()
                 .set(&DataKey::Course(course_id.clone()), &course);
-            env.storage().persistent().extend_ttl(
-                &DataKey::Course(course_id.clone()),
-                Self::PERSISTENT_TTL_THRESHOLD,
-                Self::PERSISTENT_TTL_EXTEND_TO,
-            );
+            Self::extend_persistent_ttl(&env, &DataKey::Course(course_id.clone()));
         }
 
         // Decrement platform-wide active enrollment counter
@@ -3402,11 +3559,7 @@ impl SorobanLardContract {
             .persistent()
             .set(&DataKey::Certificate(certificate_id.clone()), &certificate);
 
-        env.storage().persistent().extend_ttl(
-            &DataKey::Certificate(certificate_id.clone()),
-            Self::PERSISTENT_TTL_THRESHOLD,
-            Self::PERSISTENT_TTL_EXTEND_TO,
-        );
+        Self::extend_persistent_ttl(&env, &DataKey::Certificate(certificate_id.clone()));
 
         // Mark enrollment as certificate issued
         enrollment.certificate_issued = true;
@@ -3415,11 +3568,7 @@ impl SorobanLardContract {
             &DataKey::Enrollment(student.clone(), course_id.clone()),
             &enrollment,
         );
-        env.storage().persistent().extend_ttl(
-            &DataKey::Enrollment(student.clone(), course_id.clone()),
-            Self::PERSISTENT_TTL_THRESHOLD,
-            Self::PERSISTENT_TTL_EXTEND_TO,
-        );
+        Self::extend_persistent_ttl(&env, &DataKey::Enrollment(student.clone(), course_id.clone()));
 
         // Increment certificate count for course
         course.certificates_issued = course
@@ -3444,11 +3593,7 @@ impl SorobanLardContract {
         env.storage()
             .persistent()
             .set(&course_certs_key, &course_certs);
-        env.storage().persistent().extend_ttl(
-            &course_certs_key,
-            Self::PERSISTENT_TTL_THRESHOLD,
-            Self::PERSISTENT_TTL_EXTEND_TO,
-        );
+        Self::extend_persistent_ttl(&env, &course_certs_key);
 
         Self::update_instructor_stats(&env, &certificate.instructor, |s| {
             s.total_certificates = s
@@ -3765,6 +3910,13 @@ impl SorobanLardContract {
         admin1.require_auth();
         admin2.require_auth();
         Self::require_multi_admin(&env, &admin1, &admin2);
+
+        // #137 — Sweeping tokens to the contract itself is a no-op transfer
+        // that would still emit a misleading `tokens_withdrawn` event.
+        if destination == env.current_contract_address() {
+            panic!("withdraw_tokens: destination cannot be the contract address");
+        }
+
         let token_client = token::Client::new(&env, &token);
         token_client.transfer(&env.current_contract_address(), &destination, &amount);
 
@@ -3807,6 +3959,16 @@ impl SorobanLardContract {
 
         if new_admin == new_secondary_admin {
             panic!("admin and secondary_admin must be distinct addresses");
+        }
+
+        // #137 — Same self-reference guard as init(): the contract can never
+        // be nominated as one of its own admins.
+        if new_admin == env.current_contract_address() {
+            panic!("admin cannot be the contract address");
+        }
+
+        if new_secondary_admin == env.current_contract_address() {
+            panic!("secondary_admin cannot be the contract address");
         }
 
         // #176 — Enforce minimum cooldown between consecutive transfer_admin() calls.
@@ -4020,9 +4182,37 @@ impl SorobanLardContract {
     /// sanity check (see `validate_token_interface`), so a non-token or
     /// non-conforming contract is rejected at approval time rather than
     /// surfacing later as unpredictable enrollment failures.
+    /// # Admin requirement — standard tokens only
+    ///
+    /// Only approve standard, fee-free, non-rebasing SAC-style tokens (e.g.
+    /// the Stellar Asset Contract for USDC). The interface check cannot
+    /// prove that transfers are fee-free or balances will not rebase.
+    ///
+    /// Instructor earnings are a plain stroops counter
+    /// (`DataKey::InstructorEarnings`). It is only correct if every
+    /// `transfer(from, to, amount)` moves exactly `amount` and balances never
+    /// change on their own. With a non-standard token:
+    /// - **Fee-on-transfer**: the inbound payment in `enroll` / `re_enroll` is
+    ///   rejected by the balance-delta check ("token transfer amount
+    ///   mismatch"). Outbound transfers (`withdraw_earnings`, refunds) have no
+    ///   such check, so the recipient would get less than the amount debited.
+    /// - **Rebasing**: the contract's real balance drifts away from
+    ///   `sum(InstructorEarnings)`. A negative rebase leaves the last
+    ///   instructors to withdraw unable to do so.
+    ///
+    /// See INVARIANTS.md (token assumptions) and
+    /// `test_reconciliation_instructor_earnings_match_contract_balance`.
     pub fn add_approved_token(env: Env, admin: Address, token: Address) {
         admin.require_auth();
         Self::require_admin(&env, &admin, "add_approved_token");
+
+        // #137 — The contract is not a token contract; whitelisting its own
+        // address would let courses be priced in a "token" whose transfer()
+        // calls re-enter this contract.
+        if token == env.current_contract_address() {
+            panic!("token cannot be the contract address");
+        }
+
         Self::validate_token_interface(&env, &token);
         env.storage()
             .instance()
@@ -4144,11 +4334,7 @@ impl SorobanLardContract {
                         env.storage()
                             .persistent()
                             .set(&DataKey::Course(course_id.clone()), &course);
-                        env.storage().persistent().extend_ttl(
-                            &DataKey::Course(course_id.clone()),
-                            Self::PERSISTENT_TTL_THRESHOLD,
-                            Self::PERSISTENT_TTL_EXTEND_TO,
-                        );
+                        Self::extend_persistent_ttl(&env, &DataKey::Course(course_id.clone()));
 
                         env.events().publish(
                             (Symbol::new(&env, "course_paused"), course_id.clone()),
@@ -4187,6 +4373,11 @@ impl SorobanLardContract {
 
         if approver == admin {
             panic!("approver cannot be the admin address");
+        }
+
+        // #137 — The contract cannot be granted approver authority over itself.
+        if approver == env.current_contract_address() {
+            panic!("approver cannot be the contract address");
         }
 
         // Verify the address is not already an approver
@@ -4471,6 +4662,24 @@ impl SorobanLardContract {
             panic!("already marked as completed");
         }
 
+        // Refund requests and arbitration cases are mutually exclusive while
+        // either is still active for the same (student, course_id) pair.
+        // Without this guard a student could pursue both paths at once and
+        // receive conflicting resolutions for the same enrollment.
+        let arbitration_key = ArbitrationCaseKey {
+            caller: student.clone(),
+            course_id: course_id.clone(),
+        };
+        if let Some(case) = env
+            .storage()
+            .persistent()
+            .get::<ArbitrationCaseKey, ArbitrationCase>(&arbitration_key)
+        {
+            if case.status == DisputeStatus::Open {
+                panic!("arbitration case open for this dispute");
+            }
+        }
+
         let refund_window = env
             .storage()
             .instance()
@@ -4483,7 +4692,7 @@ impl SorobanLardContract {
             .checked_sub(enrollment.enrolled_at_ledger)
             .unwrap_or(0);
 
-        if elapsed > refund_window {
+        if elapsed >= refund_window {
             panic!("refund window has expired");
         }
 
@@ -4500,11 +4709,7 @@ impl SorobanLardContract {
         };
 
         env.storage().persistent().set(&key, &request);
-        env.storage().persistent().extend_ttl(
-            &key,
-            Self::PERSISTENT_TTL_THRESHOLD,
-            Self::PERSISTENT_TTL_EXTEND_TO,
-        );
+        Self::extend_persistent_ttl(&env, &key);
 
         env.events().publish(
             (Symbol::new(&env, "refund_requested"), course_id.clone()),
@@ -4593,11 +4798,7 @@ impl SorobanLardContract {
                 .unwrap_or_else(|| Vec::new(&env));
             history.push_back(enrollment.clone());
             env.storage().persistent().set(&history_key, &history);
-            env.storage().persistent().extend_ttl(
-                &history_key,
-                Self::PERSISTENT_TTL_THRESHOLD,
-                Self::PERSISTENT_TTL_EXTEND_TO,
-            );
+            Self::extend_persistent_ttl(&env, &history_key);
             env.storage().persistent().remove(&enrollment_key);
 
             // Decrement active enrollments
@@ -4726,7 +4927,10 @@ impl SorobanLardContract {
     //      `effective_ledger` has passed, to actually swap the code.
     // This gives observers a mandatory window to review a pending upgrade
     // (and, if compromised, react) before it can take effect. A pending
-    // upgrade can be withdrawn at any time via `cancel_upgrade`.
+    // upgrade can be withdrawn at any time via `cancel_upgrade`, which —
+    // like proposing and executing — requires BOTH admin signatures.
+    // There is currently no single-admin emergency-cancel path (see the
+    // `cancel_upgrade` doc comment for the security trade-off).
     //
     // Enrollment, certificate, and all other contract storage is untouched
     // by an upgrade — only the executable Wasm code is replaced, so
@@ -4777,6 +4981,33 @@ impl SorobanLardContract {
     }
 
     /// Cancel a pending upgrade proposal. Requires both admin signatures.
+    ///
+    /// # Signature requirement (#141)
+    /// `admin1` and `admin2` must be the current `Admin` and `SecondaryAdmin`
+    /// (in either order), must be distinct, and must BOTH sign
+    /// (`require_auth()`), enforced by `require_multi_admin()`. The admin
+    /// expiry (`set_admin_expiry`) also applies. A single admin cannot cancel
+    /// unilaterally — this is the same requirement as `propose_upgrade` and
+    /// `upgrade_contract`.
+    ///
+    /// # Security trade-off
+    /// Because proposing also needs both signatures, a single compromised
+    /// key cannot propose a malicious upgrade on its own. However, if BOTH
+    /// keys were used to propose (or one admin was coerced into co-signing),
+    /// the remaining legitimate admin has no unilateral emergency brake:
+    /// cancellation needs the cooperation of the other signer. The
+    /// time-lock window is then the only defence, and responders must rely
+    /// on off-chain coordination (or `transfer_admin`, which itself needs
+    /// both signatures). A single-admin emergency-cancel path would be a
+    /// strictly "safe" action (it can only remove a pending upgrade, never
+    /// install one) and is tracked as a design discussion rather than
+    /// implemented here.
+    ///
+    /// # Panics
+    /// - `"unauthorized: requires both admin signatures"` if the callers are
+    ///   not exactly the two current admins
+    /// - `"admin role has expired"` if the admin expiry has passed
+    /// - `"no pending upgrade"` if nothing is pending
     pub fn cancel_upgrade(env: Env, admin1: Address, admin2: Address) {
         admin1.require_auth();
         admin2.require_auth();
@@ -4950,10 +5181,17 @@ impl SorobanLardContract {
     /// Requires both admin signatures. Does not affect an already-pending
     /// upgrade's `effective_ledger` — propose a new upgrade to apply a
     /// changed time-lock.
+    ///
+    /// `ledgers` must be at least `MIN_UPGRADE_TIMELOCK_LEDGERS` (~1 day), so
+    /// even a compromised admin pair cannot remove the review window.
     pub fn set_upgrade_timelock(env: Env, admin1: Address, admin2: Address, ledgers: u32) {
         admin1.require_auth();
         admin2.require_auth();
         Self::require_multi_admin(&env, &admin1, &admin2);
+
+        if ledgers < Self::MIN_UPGRADE_TIMELOCK_LEDGERS {
+            panic!("upgrade time-lock is below the minimum allowed");
+        }
 
         env.storage()
             .instance()
@@ -4981,6 +5219,13 @@ impl SorobanLardContract {
         env.storage().instance().get(&DataKey::PendingUpgrade)
     }
 
+    /// Get the semantic version (`MAJOR.MINOR.PATCH`) of the currently
+    /// deployed contract code. Lets the backend and block explorers detect
+    /// a live Wasm upgrade without comparing Wasm hashes manually.
+    pub fn get_contract_version(env: Env) -> String {
+        String::from_str(&env, Self::CONTRACT_VERSION)
+    }
+
     // ----------------------------------------------------------
     // READ-ONLY QUERIES
     // ----------------------------------------------------------
@@ -4994,11 +5239,7 @@ impl SorobanLardContract {
         // Some or None — the has() check is cheap and the extend is a no-op when
         // the entry is absent.
         if env.storage().persistent().has(&key) {
-            env.storage().persistent().extend_ttl(
-                &key,
-                Self::PERSISTENT_TTL_THRESHOLD,
-                Self::PERSISTENT_TTL_EXTEND_TO,
-            );
+            Self::extend_persistent_ttl(&env, &key);
         }
         Self::get_course_internal(&env, &course_id)
     }
@@ -5249,16 +5490,14 @@ impl SorobanLardContract {
             .unwrap_or(false)
     }
 
-    fn course_fee_override_bps(env: &Env, course_id: &String) -> Option<u32> {
+    fn course_fee_override_bps(course: &Course) -> Option<u32> {
         // `platform_fee_percent == 0` means "follow the live token rate";
         // any other value is an explicit override captured at registration.
-        Self::get_course_internal(env, course_id).and_then(|course| {
-            if course.platform_fee_percent == 0 {
-                None
-            } else {
-                Some(course.platform_fee_percent.saturating_mul(100))
-            }
-        })
+        if course.platform_fee_percent == 0 {
+            None
+        } else {
+            Some(course.platform_fee_percent.saturating_mul(100))
+        }
     }
 
     fn get_student_enrollment_count_internal(env: &Env, student: &Address) -> u32 {
@@ -5274,11 +5513,7 @@ impl SorobanLardContract {
             .checked_add(1)
             .unwrap_or_else(|| panic!("student enrollment count overflow"));
         env.storage().persistent().set(&key, &count);
-        env.storage().persistent().extend_ttl(
-            &key,
-            Self::PERSISTENT_TTL_THRESHOLD,
-            Self::PERSISTENT_TTL_EXTEND_TO,
-        );
+        Self::extend_persistent_ttl(env, &key);
     }
 
     fn is_btc_eth_token_internal(env: &Env, token: &Address) -> bool {
@@ -5439,6 +5674,25 @@ impl SorobanLardContract {
         String::from_bytes(env, &digits[..len])
     }
 
+    /// Bump the TTL of a persistent entry using the contract-wide policy.
+    /// Every persistent TTL extension goes through here, so changing the
+    /// policy (or making it per key category) is a one-place edit.
+    ///
+    /// The host only writes a new TTL when the entry is below
+    /// `PERSISTENT_TTL_THRESHOLD`, so a call on an entry that is still
+    /// healthy does not change its expiry. SDK 22 has no getter for the
+    /// remaining TTL, so the check cannot be made in the contract itself.
+    fn extend_persistent_ttl<K>(env: &Env, key: &K)
+    where
+        K: IntoVal<Env, Val>,
+    {
+        env.storage().persistent().extend_ttl(
+            key,
+            Self::PERSISTENT_TTL_THRESHOLD,
+            Self::PERSISTENT_TTL_EXTEND_TO,
+        );
+    }
+
     /// Generate a unique enrollment reference and store the mapping
     /// from enrollment_reference -> (student, course_id).
     fn generate_enrollment_ref(env: &Env, student: &Address, course_id: &String) -> String {
@@ -5458,11 +5712,7 @@ impl SorobanLardContract {
             &DataKey::EnrollmentByRef(enrollment_ref.clone()),
             &(student.clone(), course_id.clone()),
         );
-        env.storage().persistent().extend_ttl(
-            &DataKey::EnrollmentByRef(enrollment_ref.clone()),
-            Self::PERSISTENT_TTL_THRESHOLD,
-            Self::PERSISTENT_TTL_EXTEND_TO,
-        );
+        Self::extend_persistent_ttl(env, &DataKey::EnrollmentByRef(enrollment_ref.clone()));
 
         enrollment_ref
     }
@@ -5474,11 +5724,7 @@ impl SorobanLardContract {
             .checked_add(amount)
             .unwrap_or_else(|| panic!("overflow computing instructor earnings"));
         env.storage().persistent().set(&key, &new_balance);
-        env.storage().persistent().extend_ttl(
-            &key,
-            Self::PERSISTENT_TTL_THRESHOLD,
-            Self::PERSISTENT_TTL_EXTEND_TO,
-        );
+        Self::extend_persistent_ttl(env, &key);
         // Also update the per-instructor total earnings accumulator
         let total_key = DataKey::InstructorTotalEarnings(instructor.clone());
         let current_total: i128 = env.storage().persistent().get(&total_key).unwrap_or(0);
@@ -5486,11 +5732,7 @@ impl SorobanLardContract {
             .checked_add(amount)
             .unwrap_or_else(|| panic!("overflow computing instructor total earnings"));
         env.storage().persistent().set(&total_key, &new_total);
-        env.storage().persistent().extend_ttl(
-            &total_key,
-            Self::PERSISTENT_TTL_THRESHOLD,
-            Self::PERSISTENT_TTL_EXTEND_TO,
-        );
+        Self::extend_persistent_ttl(env, &total_key);
     }
 
     fn debit_instructor_earnings(env: &Env, instructor: &Address, token: &Address, amount: i128) {
@@ -5537,11 +5779,7 @@ impl SorobanLardContract {
                 });
         f(&mut stats);
         env.storage().persistent().set(&key, &stats);
-        env.storage().persistent().extend_ttl(
-            &key,
-            Self::PERSISTENT_TTL_THRESHOLD,
-            Self::PERSISTENT_TTL_EXTEND_TO,
-        );
+        Self::extend_persistent_ttl(env, &key);
     }
 
     // ============================================================
@@ -5746,12 +5984,13 @@ impl SorobanLardContract {
     /// previews and enroll()/re_enroll(), so a quote can never diverge from
     /// the actual charge.
     ///
-    /// The contract does not yet persist per-student enrollment history or a
-    /// BTC/ETH classification for tokens, so enrollment has always charged
-    /// both flags as `false`. When that state is added, it must be read here
-    /// so previews and enrollment pick it up together.
-    fn resolve_risk_flags(_env: &Env, _student: &Address, _token: &Address) -> (bool, bool) {
-        (false, false)
+    /// `is_new_customer` is derived from the lifetime enrollment counter and
+    /// `is_btc_eth` from the token classification set by `set_token_btc_eth`,
+    /// keeping previews and enrollment in sync.
+    fn resolve_risk_flags(env: &Env, student: &Address, token: &Address) -> (bool, bool) {
+        let is_new_customer = Self::get_student_enrollment_count_internal(env, student) == 0;
+        let is_btc_eth = Self::is_btc_eth_token_internal(env, token);
+        (is_new_customer, is_btc_eth)
     }
 
     /// Computes the risk score and total surcharge (bps) for a payment.
@@ -5866,6 +6105,11 @@ impl SorobanLardContract {
     /// - `is_btc_eth` — whether the token is BTC/ETH (higher volatility)
     ///
     /// Returns `(net_amount, fee_amount)` where `net_amount + fee_amount == amount`.
+    ///
+    /// A zero (free course) or negative amount returns `(0, 0)` without
+    /// reading any fee configuration. The amount is only ever multiplied by
+    /// a basis-point rate and divided by the constant `10_000`, never used
+    /// as a divisor, so a zero price cannot cause a division-by-zero. (#131)
     fn deduct_fee(
         env: &Env,
         token: &Address,
@@ -5904,7 +6148,13 @@ impl SorobanLardContract {
     /// Escalate a dispute to arbitration. The caller must pay the
     /// arbitration fee (set via `set_arbitration_fee_config`).
     /// The fee is transferred from the caller to the contract and held
-    /// until the arbitration is resolved.
+    /// until the arbitration is resolved or the timeout auto-refunds it.
+    ///
+    /// Escalation is open to any authenticated caller. The contract does not
+    /// require the caller to be an enrolled student, so course instructors can
+    /// use the same mechanism (see the dispute-system module docs). `caller`
+    /// is recorded as the party entitled to a refund if they win or the case
+    /// times out.
     pub fn escalate_to_arbitration(env: Env, caller: Address, course_id: String) {
         caller.require_auth();
 
@@ -5921,11 +6171,28 @@ impl SorobanLardContract {
         let course = Self::get_course_internal(&env, &course_id)
             .unwrap_or_else(|| panic!("course not found"));
 
+        // An informal refund request must be resolved (approved or rejected)
+        // before the same dispute can move to formal arbitration. This keeps
+        // request_refund()/process_refund() and escalate_to_arbitration() from
+        // both being active for the same (caller, course_id).
+        let refund_key = DataKey::RefundRequest(caller.clone(), course_id.clone());
+        if let Some(refund) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, RefundRequest>(&refund_key)
+        {
+            if refund.status == RefundStatus::Pending {
+                panic!("refund request pending for this dispute");
+            }
+        }
+
         // Reject duplicate open cases for the same (caller, course_id) pair.
-        let case_key = ArbitrationCaseKey { caller: caller.clone(), course_id: course_id.clone() };
+        let case_key = ArbitrationCaseKey {
+            caller: caller.clone(),
+            course_id: course_id.clone(),
+        };
         if env.storage().persistent().has(&case_key) {
-            let existing: ArbitrationCase =
-                env.storage().persistent().get(&case_key).unwrap();
+            let existing: ArbitrationCase = env.storage().persistent().get(&case_key).unwrap();
             if existing.status == DisputeStatus::Open {
                 panic!("arbitration case already open for this dispute");
             }
@@ -5950,14 +6217,21 @@ impl SorobanLardContract {
             fee_paid: config.fee_per_case,
             opened_at_ledger: env.ledger().sequence(),
             status: DisputeStatus::Open,
+            resolved_by: None,
+            resolved_at_ledger: None,
+            resolution_reason: None,
         };
 
         env.storage().persistent().set(&case_key, &record);
-        env.storage().persistent().extend_ttl(
-            &case_key,
-            Self::PERSISTENT_TTL_THRESHOLD,
-            Self::PERSISTENT_TTL_EXTEND_TO,
-        );
+        Self::extend_persistent_ttl(&env, &case_key);
+
+        // Maintain the append-only course and student indexes so the full
+        // dispute history can be enumerated without knowing every caller in
+        // advance. A caller can only have one case record per course (the
+        // record is overwritten on re-escalation after resolution), so the
+        // caller/course is only appended the first time it is seen.
+        Self::append_course_arbitration_case(&env, &course_id, &caller);
+        Self::append_student_arbitration_case(&env, &caller, &course_id);
 
         env.events().publish(
             (Symbol::new(&env, "dispute_escalated"), course_id.clone()),
@@ -5973,31 +6247,96 @@ impl SorobanLardContract {
         caller: Address,
         course_id: String,
     ) -> Option<ArbitrationCase> {
-        env.storage()
-            .persistent()
-            .get(&ArbitrationCaseKey { caller, course_id })
+        Self::get_arbitration_case_internal(&env, &caller, &course_id)
     }
 
-    /// Admin function to resolve an open arbitration case and disburse the fee.
+    /// Enumerate every arbitration case ever opened for a course, in
+    /// escalation order.
+    ///
+    /// The index is append-only: resolving a case changes its `status` but
+    /// never removes it from this list, so the full dispute history for a
+    /// course remains available on-chain. Returns an empty list if the course
+    /// has no disputes.
+    pub fn get_arbitration_cases_by_course(env: Env, course_id: String) -> Vec<ArbitrationCase> {
+        let callers: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey2::CourseArbitrationCases(course_id.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut cases = Vec::new(&env);
+        for i in 0..callers.len() {
+            let caller = callers.get(i).unwrap();
+            if let Some(case) = Self::get_arbitration_case_internal(&env, &caller, &course_id) {
+                cases.push_back(case);
+            }
+        }
+        cases
+    }
+
+    /// Enumerate every arbitration case ever opened by a student, in
+    /// escalation order across all courses.
+    ///
+    /// Returns an empty list if the student has never escalated a dispute.
+    pub fn get_arbitration_cases_by_student(env: Env, student: Address) -> Vec<ArbitrationCase> {
+        let course_ids: Vec<String> = env
+            .storage()
+            .persistent()
+            .get(&DataKey2::StudentArbitrationCases(student.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut cases = Vec::new(&env);
+        for i in 0..course_ids.len() {
+            let course_id = course_ids.get(i).unwrap();
+            if let Some(case) = Self::get_arbitration_case_internal(&env, &student, &course_id) {
+                cases.push_back(case);
+            }
+        }
+        cases
+    }
+
+    /// Resolve an open arbitration case and disburse the held fee.
+    ///
+    /// Resolution moves real funds, so it requires both the Admin and the
+    /// Secondary Admin to co-sign — matching the platform's other
+    /// fund-moving operations (`withdraw_tokens`, `archive_course`, ...).
+    /// Requiring both keys means no single compromised admin can award a
+    /// dispute unilaterally. A revocation-style challenge window is a poor
+    /// fit here because arbitration pays the fee out immediately: reversing
+    /// the ruling would require clawing tokens back from a recipient who may
+    /// already have spent them, whereas the co-signature prevents a bad
+    /// ruling before any funds move.
     ///
     /// - `for_student = true`  — refund the fee to the original caller (student won).
     /// - `for_student = false` — transfer the fee to the course instructor (instructor won).
     ///
-    /// Panics if the case does not exist or is not `Open`.
+    /// Admin resolution is only allowed while the case is within its SLA (fewer
+    /// than `ARBITRATION_TIMEOUT_LEDGERS` since it was opened). Once the timeout
+    /// has elapsed the fee belongs to the escalating party and must be settled
+    /// with `claim_arbitration_timeout`; a late admin resolution panics so an
+    /// admin cannot deny the caller the timeout refund.
+    ///
+    /// Panics if the case does not exist, is not `Open`, or has timed out.
     pub fn resolve_arbitration(
         env: Env,
         admin: Address,
+        secondary_admin: Address,
         caller: Address,
         course_id: String,
         for_student: bool,
+        reason: String,
     ) {
         admin.require_auth();
-        Self::require_admin(&env, &admin, "resolve_arbitration");
+        secondary_admin.require_auth();
+        Self::require_multi_admin(&env, &admin, &secondary_admin);
         env.storage()
             .instance()
             .extend_ttl(Self::INSTANCE_TTL_THRESHOLD, Self::INSTANCE_TTL_EXTEND_TO);
 
-        let case_key = ArbitrationCaseKey { caller: caller.clone(), course_id: course_id.clone() };
+        let case_key = ArbitrationCaseKey {
+            caller: caller.clone(),
+            course_id: course_id.clone(),
+        };
         let mut case: ArbitrationCase = env
             .storage()
             .persistent()
@@ -6008,7 +6347,12 @@ impl SorobanLardContract {
             panic!("arbitration case is not open");
         }
 
+        if env.ledger().sequence() >= Self::arbitration_timeout_at(&case) {
+            panic!("arbitration case has timed out; use claim_arbitration_timeout");
+        }
+
         let token_client = token::Client::new(&env, &case.token);
+        let resolved_at_ledger = env.ledger().sequence();
 
         if for_student {
             // Refund the fee to the student who escalated.
@@ -6028,17 +6372,160 @@ impl SorobanLardContract {
             case.status = DisputeStatus::ResolvedForInstructor;
         }
 
+        case.resolved_by = Some(admin.clone());
+        case.resolved_at_ledger = Some(resolved_at_ledger);
+        case.resolution_reason = Some(reason.clone());
+
         env.storage().persistent().set(&case_key, &case);
-        env.storage().persistent().extend_ttl(
-            &case_key,
-            Self::PERSISTENT_TTL_THRESHOLD,
-            Self::PERSISTENT_TTL_EXTEND_TO,
+        Self::extend_persistent_ttl(&env, &case_key);
+
+        let outcome_topic = if for_student {
+            Symbol::new(&env, "resolved_for_student")
+        } else {
+            Symbol::new(&env, "resolved_for_instructor")
+        };
+        let event = ArbitrationResolved {
+            case_id: case.case_id.clone(),
+            course_id: case.course_id.clone(),
+            caller: case.caller.clone(),
+            instructor: case.instructor.clone(),
+            outcome: case.status.clone(),
+            fee_paid: case.fee_paid,
+            resolved_by: admin,
+            secondary_admin,
+            resolved_at_ledger,
+        };
+        env.events().publish(
+            (
+                Symbol::new(&env, "arbitration_resolved"),
+                case.case_id,
+                outcome_topic,
+            ),
+            event,
+        );
+    }
+
+    /// Permissionlessly settle an arbitration case whose admin-resolution SLA
+    /// (`ARBITRATION_TIMEOUT_LEDGERS`) has elapsed.
+    ///
+    /// The full fee is refunded to the address that originally escalated the
+    /// case and the status becomes `DisputeStatus::AutoRefunded`. This function
+    /// intentionally requires no auth: any party (the escalating student, the
+    /// course instructor, or an observer) can trigger the refund, which always
+    /// goes to `case.caller`. Soroban cannot schedule contract execution on its
+    /// own, so this permissionless call is how the timeout is enforced.
+    ///
+    /// Panics if the case does not exist, is not `Open`, or the timeout has not
+    /// yet elapsed.
+    pub fn claim_arbitration_timeout(env: Env, caller: Address, course_id: String) {
+        env.storage()
+            .instance()
+            .extend_ttl(Self::INSTANCE_TTL_THRESHOLD, Self::INSTANCE_TTL_EXTEND_TO);
+
+        let case_key = ArbitrationCaseKey {
+            caller: caller.clone(),
+            course_id: course_id.clone(),
+        };
+        let mut case: ArbitrationCase = env
+            .storage()
+            .persistent()
+            .get(&case_key)
+            .unwrap_or_else(|| panic!("arbitration case not found"));
+
+        if case.status != DisputeStatus::Open {
+            panic!("arbitration case is not open");
+        }
+
+        if env.ledger().sequence() < Self::arbitration_timeout_at(&case) {
+            panic!("arbitration timeout has not elapsed");
+        }
+
+        let token_client = token::Client::new(&env, &case.token);
+        token_client.transfer(
+            &env.current_contract_address(),
+            &case.caller,
+            &case.fee_paid,
         );
 
+        case.status = DisputeStatus::AutoRefunded;
+        env.storage().persistent().set(&case_key, &case);
+        Self::extend_persistent_ttl(&env, &case_key);
+
         env.events().publish(
-            (Symbol::new(&env, "arbitration_resolved"), course_id.clone()),
-            (caller, course_id, for_student, admin),
+            (
+                Symbol::new(&env, "arbitration_auto_refunded"),
+                course_id.clone(),
+            ),
+            (
+                case.caller.clone(),
+                course_id,
+                case.fee_paid,
+                env.ledger().sequence(),
+            ),
         );
+    }
+
+    /// Returns the admin-resolution SLA for arbitration cases, in ledgers.
+    pub fn get_arbitration_timeout_ledgers(_env: Env) -> u32 {
+        Self::ARBITRATION_TIMEOUT_LEDGERS
+    }
+
+    /// Ledger at which an open arbitration case becomes eligible for the
+    /// timeout auto-refund. Saturating arithmetic keeps a malformed/overflowing
+    /// `opened_at_ledger` from wrapping into an early refund.
+    fn arbitration_timeout_at(case: &ArbitrationCase) -> u32 {
+        case.opened_at_ledger
+            .saturating_add(Self::ARBITRATION_TIMEOUT_LEDGERS)
+    }
+
+    fn append_course_arbitration_case(env: &Env, course_id: &String, caller: &Address) {
+        let key = DataKey2::CourseArbitrationCases(course_id.clone());
+        let mut callers: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(env));
+
+        for i in 0..callers.len() {
+            if callers.get(i).unwrap() == *caller {
+                return;
+            }
+        }
+
+        callers.push_back(caller.clone());
+        env.storage().persistent().set(&key, &callers);
+        Self::extend_persistent_ttl(env, &key);
+    }
+
+    fn append_student_arbitration_case(env: &Env, student: &Address, course_id: &String) {
+        let key = DataKey2::StudentArbitrationCases(student.clone());
+        let mut course_ids: Vec<String> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(env));
+
+        for i in 0..course_ids.len() {
+            if course_ids.get(i).unwrap() == *course_id {
+                return;
+            }
+        }
+
+        course_ids.push_back(course_id.clone());
+        env.storage().persistent().set(&key, &course_ids);
+        Self::extend_persistent_ttl(env, &key);
+    }
+
+    fn get_arbitration_case_internal(
+        env: &Env,
+        caller: &Address,
+        course_id: &String,
+    ) -> Option<ArbitrationCase> {
+        let key = ArbitrationCaseKey {
+            caller: caller.clone(),
+            course_id: course_id.clone(),
+        };
+        env.storage().persistent().get(&key)
     }
 
     /// Complete a payment with a risk assessment.
@@ -6120,11 +6607,7 @@ impl SorobanLardContract {
 
         waitlist.push_back(student.clone());
         env.storage().persistent().set(&waitlist_key, &waitlist);
-        env.storage().persistent().extend_ttl(
-            &waitlist_key,
-            Self::PERSISTENT_TTL_THRESHOLD,
-            Self::PERSISTENT_TTL_EXTEND_TO,
-        );
+        Self::extend_persistent_ttl(&env, &waitlist_key);
 
         env.events().publish(
             (Symbol::new(&env, "waitlist_joined"), course_id.clone()),
@@ -6169,11 +6652,7 @@ impl SorobanLardContract {
 
         if new_waitlist.len() > 0 {
             env.storage().persistent().set(&waitlist_key, &new_waitlist);
-            env.storage().persistent().extend_ttl(
-                &waitlist_key,
-                Self::PERSISTENT_TTL_THRESHOLD,
-                Self::PERSISTENT_TTL_EXTEND_TO,
-            );
+            Self::extend_persistent_ttl(&env, &waitlist_key);
         } else {
             env.storage().persistent().remove(&waitlist_key);
         }
@@ -6214,11 +6693,7 @@ impl SorobanLardContract {
 
                 if new_waitlist.len() > 0 {
                     env.storage().persistent().set(&waitlist_key, &new_waitlist);
-                    env.storage().persistent().extend_ttl(
-                        &waitlist_key,
-                        Self::PERSISTENT_TTL_THRESHOLD,
-                        Self::PERSISTENT_TTL_EXTEND_TO,
-                    );
+                    Self::extend_persistent_ttl(env, &waitlist_key);
                 } else {
                     env.storage().persistent().remove(&waitlist_key);
                 }

@@ -124,7 +124,7 @@
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
                 },
                 {
-                  "u32": 500
+                  "u32": 51840
                 }
               ]
             }
@@ -147,7 +147,7 @@
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
                 },
                 {
-                  "u32": 500
+                  "u32": 51840
                 }
               ]
             }
@@ -384,7 +384,7 @@
                           ]
                         },
                         "val": {
-                          "u32": 500
+                          "u32": 51840
                         }
                       }
                     ]
