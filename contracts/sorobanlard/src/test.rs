@@ -13995,3 +13995,357 @@ fn test_current_wasm_hash_none_before_first_upgrade() {
 
     assert_eq!(client.get_current_wasm_hash(), None);
 }
+
+// ============================================================
+// ISSUE 293: FREE COURSE ENROLLMENT (price = 0)
+// ============================================================
+
+#[test]
+fn test_batch_enroll_free_courses_no_token_transfer() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    let token_client = token::Client::new(&env, &token_id);
+    let starting_balance = token_client.balance(&student);
+
+    register_and_approve_course(
+        &env, &client, &token_id, &admin, &instructor, "COURSE-FREE-BATCH-1", 0,
+    );
+    register_and_approve_course(
+        &env, &client, &token_id, &admin, &instructor, "COURSE-FREE-BATCH-2", 0,
+    );
+
+    let course_ids = soroban_sdk::vec![
+        &env,
+        String::from_str(&env, "COURSE-FREE-BATCH-1"),
+        String::from_str(&env, "COURSE-FREE-BATCH-2"),
+    ];
+    client.batch_enroll(&student, &course_ids);
+
+    // No tokens should have moved for either free course.
+    assert_eq!(token_client.balance(&student), starting_balance);
+
+    for id in ["COURSE-FREE-BATCH-1", "COURSE-FREE-BATCH-2"] {
+        let course = client.get_course(&String::from_str(&env, id)).unwrap();
+        assert_eq!(course.total_earned, 0);
+        assert_eq!(course.active_enrollments, 1);
+        let enrollment = client
+            .get_enrollment(&student, &student, &String::from_str(&env, id))
+            .unwrap();
+        assert_eq!(enrollment.amount_paid, 0);
+        assert_eq!(enrollment.platform_amount, 0);
+        assert_eq!(enrollment.instructor_amount, 0);
+    }
+}
+
+#[test]
+fn test_free_course_completion_requires_no_payment_but_still_tracked() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    register_and_approve_course(
+        &env, &client, &token_id, &admin, &instructor, "COURSE-FREE-COMPLETE", 0,
+    );
+    let course_id = String::from_str(&env, "COURSE-FREE-COMPLETE");
+    client.enroll(&student, &course_id);
+
+    // Instructor's accrued earnings must stay at zero for a free course even
+    // after the enrollment is marked completed.
+    client.mark_completed(&admin, &student, &course_id, &None);
+
+    let enrollment = client
+        .get_enrollment(&student, &student, &course_id)
+        .unwrap();
+    assert!(enrollment.completed);
+    assert_eq!(enrollment.amount_paid, 0);
+
+    let instructor_earnings = client.get_instructor_earnings(&instructor, &token_id);
+    assert_eq!(instructor_earnings, 0);
+}
+
+// ============================================================
+// ISSUE 292: REJECT_COURSE FLOW AND REJECTED TERMINAL STATE
+// ============================================================
+
+#[test]
+fn test_reject_course_transitions_pending_to_rejected() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let course_id = String::from_str(&env, "COURSE-REJECT-FLOW");
+    client.register_course(
+        &instructor,
+        &course_id,
+        &100_000_000,
+        &token_id,
+        &0u32,
+        &None,
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &soroban_sdk::Vec::new(&env),
+    );
+
+    client.reject_course(
+        &admin,
+        &course_id,
+        &String::from_str(&env, "CONTENT_POLICY_VIOLATION"),
+    );
+
+    let course = client.get_course(&course_id).unwrap();
+    assert_eq!(course.status, CourseStatus::Rejected);
+}
+
+#[test]
+#[should_panic(expected = "course is not pending approval")]
+fn test_reject_course_fails_if_not_pending() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    // register_and_approve_course leaves the course Active, not Pending.
+    register_and_approve_course(
+        &env, &client, &token_id, &admin, &instructor, "COURSE-REJECT-NOTPENDING", 100_000_000,
+    );
+
+    client.reject_course(
+        &admin,
+        &String::from_str(&env, "COURSE-REJECT-NOTPENDING"),
+        &String::from_str(&env, "DUPLICATE_COURSE"),
+    );
+}
+
+#[test]
+#[should_panic(expected = "course is not pending approval")]
+fn test_rejected_course_cannot_be_rejected_again() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let course_id = String::from_str(&env, "COURSE-REJECT-TWICE");
+    client.register_course(
+        &instructor,
+        &course_id,
+        &100_000_000,
+        &token_id,
+        &0u32,
+        &None,
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &soroban_sdk::Vec::new(&env),
+    );
+
+    client.reject_course(&admin, &course_id, &String::from_str(&env, "SPAM"));
+    // Rejected is a terminal state: a second rejection must not succeed.
+    client.reject_course(&admin, &course_id, &String::from_str(&env, "SPAM"));
+}
+
+#[test]
+#[should_panic(expected = "course is not pending approval")]
+fn test_rejected_course_cannot_be_approved() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let course_id = String::from_str(&env, "COURSE-REJECT-THEN-APPROVE");
+    client.register_course(
+        &instructor,
+        &course_id,
+        &100_000_000,
+        &token_id,
+        &0u32,
+        &None,
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &soroban_sdk::Vec::new(&env),
+    );
+
+    client.reject_course(&admin, &course_id, &String::from_str(&env, "SPAM"));
+    // Rejected is terminal: approval must never resurrect the course.
+    client.approve_course(&admin, &course_id);
+}
+
+#[test]
+#[should_panic(expected = "course is not available for enrollment")]
+fn test_rejected_course_cannot_be_enrolled_in() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    let course_id = String::from_str(&env, "COURSE-REJECT-ENROLL");
+    client.register_course(
+        &instructor,
+        &course_id,
+        &100_000_000,
+        &token_id,
+        &0u32,
+        &None,
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &soroban_sdk::Vec::new(&env),
+    );
+    env.ledger().with_mut(|l| {
+        l.sequence_number += 1;
+    });
+    client.reject_course(&admin, &course_id, &String::from_str(&env, "SPAM"));
+
+    client.enroll(&student, &course_id);
+}
+
+// ============================================================
+// ISSUE 256 / 167: HIGH-VALUE COURSE CO-SIGNATURE FLOW
+// ============================================================
+
+#[test]
+fn test_high_value_course_requires_two_different_admins() {
+    let (env, contract_id, token_id, admin, sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    client.set_high_value_course_threshold(&admin, &50_000_000_000); // $5,000
+
+    let course_id = String::from_str(&env, "COURSE-HIGHVALUE-1");
+    client.register_course(
+        &instructor,
+        &course_id,
+        &50_000_000_000, // at threshold -> high value
+        &token_id,
+        &0u32,
+        &None,
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &soroban_sdk::Vec::new(&env),
+    );
+    env.ledger().with_mut(|l| {
+        l.sequence_number += 1;
+    });
+
+    // Admin must register the secondary admin as an approver so a second,
+    // distinct signer is available to co-sign approve_course.
+    client.add_approver(&admin, &sec_admin);
+
+    // First approval records the approver but does not activate the course.
+    client.approve_course(&admin, &course_id);
+    let course = client.get_course(&course_id).unwrap();
+    assert_eq!(course.status, CourseStatus::Pending);
+
+    // Second approval from a different admin/approver activates it.
+    client.approve_course(&sec_admin, &course_id);
+    let course = client.get_course(&course_id).unwrap();
+    assert_eq!(course.status, CourseStatus::Active);
+}
+
+#[test]
+#[should_panic(expected = "high_value_course_approval: same admin cannot double-sign")]
+fn test_high_value_course_same_admin_cannot_double_sign() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    client.set_high_value_course_threshold(&admin, &50_000_000_000);
+
+    let course_id = String::from_str(&env, "COURSE-HIGHVALUE-DOUBLESIGN");
+    client.register_course(
+        &instructor,
+        &course_id,
+        &50_000_000_000,
+        &token_id,
+        &0u32,
+        &None,
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &soroban_sdk::Vec::new(&env),
+    );
+    env.ledger().with_mut(|l| {
+        l.sequence_number += 1;
+    });
+
+    client.approve_course(&admin, &course_id);
+    // Same admin attempting the second co-signature must panic rather than
+    // letting a single admin activate a high-value course alone.
+    client.approve_course(&admin, &course_id);
+}
+
+#[test]
+fn test_course_below_high_value_threshold_approves_with_single_admin() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    client.set_high_value_course_threshold(&admin, &50_000_000_000);
+
+    let course_id = String::from_str(&env, "COURSE-BELOW-THRESHOLD");
+    client.register_course(
+        &instructor,
+        &course_id,
+        &49_999_999_999, // just under threshold
+        &token_id,
+        &0u32,
+        &None,
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &soroban_sdk::Vec::new(&env),
+    );
+    env.ledger().with_mut(|l| {
+        l.sequence_number += 1;
+    });
+
+    // A single admin signature is sufficient below the threshold.
+    client.approve_course(&admin, &course_id);
+    let course = client.get_course(&course_id).unwrap();
+    assert_eq!(course.status, CourseStatus::Active);
+}
+
+// ============================================================
+// ISSUE 255: ARCHIVE COOLDOWN RE-REGISTRATION (ARCHIVE_COOLDOWN_LEDGERS)
+// ============================================================
+
+#[test]
+fn test_reregister_succeeds_once_cooldown_fully_elapses() {
+    let (env, contract_id, token_id, admin, sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    register_and_approve_course(
+        &env, &client, &token_id, &admin, &instructor, "COURSE-COOLDOWN-REREG", 100_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-COOLDOWN-REREG");
+
+    client.pause_course(&admin, &course_id);
+    client.archive_course(&admin, &sec_admin, &course_id, &None);
+
+    let archived_at = client
+        .get_course(&course_id)
+        .unwrap()
+        .archived_at_ledger
+        .unwrap();
+
+    // One ledger before the boundary the course ID must still be reserved.
+    env.ledger().with_mut(|l| {
+        l.sequence_number = archived_at + SorobanLardContract::ARCHIVE_COOLDOWN_LEDGERS - 1;
+    });
+    let still_blocked = client.try_register_course(
+        &instructor,
+        &course_id,
+        &100_000_000,
+        &token_id,
+        &0u32,
+        &None,
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &soroban_sdk::Vec::new(&env),
+    );
+    assert!(
+        still_blocked.is_err(),
+        "the ledger just before the cooldown boundary must still be within the cooldown"
+    );
+
+    // Exactly at the boundary (current_ledger == archived_at + COOLDOWN),
+    // the cooldown has fully elapsed and re-registration must succeed,
+    // starting a fresh Pending course under the same ID.
+    env.ledger().with_mut(|l| {
+        l.sequence_number = archived_at + SorobanLardContract::ARCHIVE_COOLDOWN_LEDGERS;
+    });
+    client.register_course(
+        &instructor,
+        &course_id,
+        &200_000_000,
+        &token_id,
+        &0u32,
+        &None,
+        &BytesN::from_array(&env, &[2u8; 32]),
+        &soroban_sdk::Vec::new(&env),
+    );
+
+    let reregistered = client.get_course(&course_id).unwrap();
+    assert_eq!(reregistered.status, CourseStatus::Pending);
+    assert_eq!(reregistered.price, 200_000_000);
+    assert_eq!(reregistered.archived_at_ledger, None);
+    assert_eq!(reregistered.total_enrollments, 0);
+}
