@@ -14185,3 +14185,101 @@ fn test_rejected_course_cannot_be_enrolled_in() {
 
     client.enroll(&student, &course_id);
 }
+
+// ============================================================
+// ISSUE 256 / 167: HIGH-VALUE COURSE CO-SIGNATURE FLOW
+// ============================================================
+
+#[test]
+fn test_high_value_course_requires_two_different_admins() {
+    let (env, contract_id, token_id, admin, sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    client.set_high_value_course_threshold(&admin, &50_000_000_000); // $5,000
+
+    let course_id = String::from_str(&env, "COURSE-HIGHVALUE-1");
+    client.register_course(
+        &instructor,
+        &course_id,
+        &50_000_000_000, // at threshold -> high value
+        &token_id,
+        &0u32,
+        &None,
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &soroban_sdk::Vec::new(&env),
+    );
+    env.ledger().with_mut(|l| {
+        l.sequence_number += 1;
+    });
+
+    // Admin must register the secondary admin as an approver so a second,
+    // distinct signer is available to co-sign approve_course.
+    client.add_approver(&admin, &sec_admin);
+
+    // First approval records the approver but does not activate the course.
+    client.approve_course(&admin, &course_id);
+    let course = client.get_course(&course_id).unwrap();
+    assert_eq!(course.status, CourseStatus::Pending);
+
+    // Second approval from a different admin/approver activates it.
+    client.approve_course(&sec_admin, &course_id);
+    let course = client.get_course(&course_id).unwrap();
+    assert_eq!(course.status, CourseStatus::Active);
+}
+
+#[test]
+#[should_panic(expected = "high_value_course_approval: same admin cannot double-sign")]
+fn test_high_value_course_same_admin_cannot_double_sign() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    client.set_high_value_course_threshold(&admin, &50_000_000_000);
+
+    let course_id = String::from_str(&env, "COURSE-HIGHVALUE-DOUBLESIGN");
+    client.register_course(
+        &instructor,
+        &course_id,
+        &50_000_000_000,
+        &token_id,
+        &0u32,
+        &None,
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &soroban_sdk::Vec::new(&env),
+    );
+    env.ledger().with_mut(|l| {
+        l.sequence_number += 1;
+    });
+
+    client.approve_course(&admin, &course_id);
+    // Same admin attempting the second co-signature must panic rather than
+    // letting a single admin activate a high-value course alone.
+    client.approve_course(&admin, &course_id);
+}
+
+#[test]
+fn test_course_below_high_value_threshold_approves_with_single_admin() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    client.set_high_value_course_threshold(&admin, &50_000_000_000);
+
+    let course_id = String::from_str(&env, "COURSE-BELOW-THRESHOLD");
+    client.register_course(
+        &instructor,
+        &course_id,
+        &49_999_999_999, // just under threshold
+        &token_id,
+        &0u32,
+        &None,
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &soroban_sdk::Vec::new(&env),
+    );
+    env.ledger().with_mut(|l| {
+        l.sequence_number += 1;
+    });
+
+    // A single admin signature is sufficient below the threshold.
+    client.approve_course(&admin, &course_id);
+    let course = client.get_course(&course_id).unwrap();
+    assert_eq!(course.status, CourseStatus::Active);
+}
