@@ -3015,6 +3015,73 @@ fn test_add_approved_token_unauthorized_includes_operation() {
 }
 
 #[test]
+fn test_add_approved_token_allows_enrollment_with_new_token() {
+    let (env, contract_id, _token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    // Deploy a second, standard-conforming SAC token that is not yet approved.
+    let new_token_admin = Address::generate(&env);
+    let new_token_id = env
+        .register_stellar_asset_contract_v2(new_token_admin.clone())
+        .address();
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &new_token_id).mint(&student, &100_000_000_000);
+
+    client.add_approved_token(&admin, &new_token_id);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &new_token_id,
+        &admin,
+        &instructor,
+        "COURSE-NEW-TOKEN-001",
+        50_000_000,
+    );
+
+    // Enrollment succeeds now that the token is on the whitelist.
+    client.enroll(&student, &String::from_str(&env, "COURSE-NEW-TOKEN-001"));
+    assert!(client.is_enrolled(&student, &String::from_str(&env, "COURSE-NEW-TOKEN-001")));
+}
+
+#[test]
+#[should_panic(expected = "course token is not approved")]
+fn test_remove_approved_token_blocks_new_enrollment() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-REMOVE-TOKEN-001",
+        50_000_000,
+    );
+
+    client.remove_approved_token(&admin, &token_id);
+
+    // Token is no longer whitelisted, so enrollment must be rejected even
+    // though the course itself is still Active.
+    client.enroll(&student, &String::from_str(&env, "COURSE-REMOVE-TOKEN-001"));
+}
+
+#[test]
+#[should_panic(expected = "unauthorized: remove_approved_token")]
+fn test_remove_approved_token_unauthorized_includes_operation() {
+    let (env, contract_id, token_id, _admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    // Instructor (not admin) tries to remove an approved token.
+    client.remove_approved_token(&instructor, &token_id);
+}
+
+#[test]
 #[should_panic(expected = "unauthorized: revoke_certificate")]
 fn test_revoke_certificate_unauthorized_includes_operation() {
     let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
