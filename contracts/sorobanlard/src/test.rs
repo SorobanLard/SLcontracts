@@ -13995,3 +13995,127 @@ fn test_current_wasm_hash_none_before_first_upgrade() {
 
     assert_eq!(client.get_current_wasm_hash(), None);
 }
+
+// ============================================================
+// ADMIN EXPIRY TESTS (#254)
+// ============================================================
+
+#[test]
+#[should_panic(expected = "expiry must be in the future")]
+fn test_set_admin_expiry_rejects_non_future_ledger() {
+    let (env, contract_id, _token_id, admin, sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let current = env.ledger().sequence();
+    client.set_admin_expiry(&admin, &sec_admin, &Some(current));
+}
+
+#[test]
+fn test_set_admin_expiry_and_get_roundtrip() {
+    let (env, contract_id, _token_id, admin, sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let expires_at = env.ledger().sequence() + 100;
+    client.set_admin_expiry(&admin, &sec_admin, &Some(expires_at));
+    assert_eq!(client.get_admin_expiry(), Some(expires_at));
+
+    // Clearing the expiry removes the block entirely.
+    client.set_admin_expiry(&admin, &sec_admin, &None);
+    assert_eq!(client.get_admin_expiry(), None);
+}
+
+#[test]
+#[should_panic(expected = "admin role has expired")]
+fn test_admin_expiry_blocks_single_admin_operation() {
+    let (env, contract_id, token_id, admin, sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let expires_at = env.ledger().sequence() + 5;
+    client.set_admin_expiry(&admin, &sec_admin, &Some(expires_at));
+
+    client.register_course(
+        &instructor,
+        &String::from_str(&env, "COURSE-EXP-1"),
+        &100_000_000i128,
+        &token_id,
+        &0u32,
+        &None,
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &soroban_sdk::Vec::new(&env),
+    );
+
+    // Advance the ledger to/past the configured expiry.
+    env.ledger().with_mut(|l| {
+        l.sequence_number = expires_at;
+    });
+
+    // approve_course is a single-admin operation and must now be blocked.
+    client.approve_course(&admin, &String::from_str(&env, "COURSE-EXP-1"));
+}
+
+#[test]
+#[should_panic(expected = "admin role has expired")]
+fn test_admin_expiry_blocks_multi_admin_operation() {
+    let (env, contract_id, _token_id, admin, sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let expires_at = env.ledger().sequence() + 5;
+    client.set_admin_expiry(&admin, &sec_admin, &Some(expires_at));
+
+    env.ledger().with_mut(|l| {
+        l.sequence_number = expires_at;
+    });
+
+    // set_admin_expiry itself is a multi-admin operation and must now be
+    // blocked once the previously configured expiry has passed.
+    client.set_admin_expiry(&admin, &sec_admin, &Some(expires_at + 100));
+}
+
+#[test]
+#[should_panic(expected = "admin role has expired")]
+fn test_admin_expiry_blocks_block_student() {
+    let (env, contract_id, _token_id, admin, sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    let expires_at = env.ledger().sequence() + 5;
+    client.set_admin_expiry(&admin, &sec_admin, &Some(expires_at));
+
+    env.ledger().with_mut(|l| {
+        l.sequence_number = expires_at;
+    });
+
+    client.block_student(&admin, &student);
+}
+
+#[test]
+fn test_admin_operations_resume_after_expiry_cleared() {
+    let (env, contract_id, token_id, admin, sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let expires_at = env.ledger().sequence() + 5;
+    client.set_admin_expiry(&admin, &sec_admin, &Some(expires_at));
+
+    // Clear the expiry before it takes effect — admin ops must keep working.
+    client.set_admin_expiry(&admin, &sec_admin, &None);
+
+    env.ledger().with_mut(|l| {
+        l.sequence_number = expires_at + 10;
+    });
+
+    client.register_course(
+        &instructor,
+        &String::from_str(&env, "COURSE-EXP-2"),
+        &100_000_000i128,
+        &token_id,
+        &0u32,
+        &None,
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &soroban_sdk::Vec::new(&env),
+    );
+    env.ledger().with_mut(|l| {
+        l.sequence_number += 1;
+    });
+    // Should not panic — admin role is no longer bound by a cleared expiry.
+    client.approve_course(&admin, &String::from_str(&env, "COURSE-EXP-2"));
+}
