@@ -13995,3 +13995,52 @@ fn test_current_wasm_hash_none_before_first_upgrade() {
 
     assert_eq!(client.get_current_wasm_hash(), None);
 }
+
+// ============================================================
+// COURSE_REGISTERED EVENT PAYLOAD TESTS (#325)
+// ============================================================
+
+/// #325 — register_course() must emit a `course_registered` event whose
+/// topic carries the new course_id and whose payload is the same course_id.
+#[test]
+fn test_course_registered_event_payload() {
+    let (env, contract_id, token_id, _admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let course_id = client.register_course(
+        &instructor,
+        &String::from_str(&env, "COURSE-EVT-325"),
+        &100_000_000i128,
+        &token_id,
+        &0u32,
+        &None,
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &soroban_sdk::Vec::new(&env),
+    );
+
+    let events = env.events().all();
+    let mut matched = 0u32;
+
+    for (contract, topics, data) in events.iter() {
+        if contract != contract_id {
+            continue;
+        }
+
+        let topic0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        if topic0 != Symbol::new(&env, "course_registered") {
+            continue;
+        }
+
+        matched += 1;
+
+        // Topic 1 carries the course_id.
+        let topic_course_id: String = topics.get(1).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(topic_course_id, course_id);
+
+        // Payload is the course_id too.
+        let payload_course_id: String = data.try_into_val(&env).unwrap();
+        assert_eq!(payload_course_id, course_id);
+    }
+
+    assert_eq!(matched, 1, "expected exactly one course_registered event");
+}
