@@ -14064,3 +14064,124 @@ fn test_free_course_completion_requires_no_payment_but_still_tracked() {
     let instructor_earnings = client.get_instructor_earnings(&instructor, &token_id);
     assert_eq!(instructor_earnings, 0);
 }
+
+// ============================================================
+// ISSUE 292: REJECT_COURSE FLOW AND REJECTED TERMINAL STATE
+// ============================================================
+
+#[test]
+fn test_reject_course_transitions_pending_to_rejected() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let course_id = String::from_str(&env, "COURSE-REJECT-FLOW");
+    client.register_course(
+        &instructor,
+        &course_id,
+        &100_000_000,
+        &token_id,
+        &0u32,
+        &None,
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &soroban_sdk::Vec::new(&env),
+    );
+
+    client.reject_course(
+        &admin,
+        &course_id,
+        &String::from_str(&env, "CONTENT_POLICY_VIOLATION"),
+    );
+
+    let course = client.get_course(&course_id).unwrap();
+    assert_eq!(course.status, CourseStatus::Rejected);
+}
+
+#[test]
+#[should_panic(expected = "course is not pending approval")]
+fn test_reject_course_fails_if_not_pending() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    // register_and_approve_course leaves the course Active, not Pending.
+    register_and_approve_course(
+        &env, &client, &token_id, &admin, &instructor, "COURSE-REJECT-NOTPENDING", 100_000_000,
+    );
+
+    client.reject_course(
+        &admin,
+        &String::from_str(&env, "COURSE-REJECT-NOTPENDING"),
+        &String::from_str(&env, "DUPLICATE_COURSE"),
+    );
+}
+
+#[test]
+#[should_panic(expected = "course is not pending approval")]
+fn test_rejected_course_cannot_be_rejected_again() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let course_id = String::from_str(&env, "COURSE-REJECT-TWICE");
+    client.register_course(
+        &instructor,
+        &course_id,
+        &100_000_000,
+        &token_id,
+        &0u32,
+        &None,
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &soroban_sdk::Vec::new(&env),
+    );
+
+    client.reject_course(&admin, &course_id, &String::from_str(&env, "SPAM"));
+    // Rejected is a terminal state: a second rejection must not succeed.
+    client.reject_course(&admin, &course_id, &String::from_str(&env, "SPAM"));
+}
+
+#[test]
+#[should_panic(expected = "course is not pending approval")]
+fn test_rejected_course_cannot_be_approved() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let course_id = String::from_str(&env, "COURSE-REJECT-THEN-APPROVE");
+    client.register_course(
+        &instructor,
+        &course_id,
+        &100_000_000,
+        &token_id,
+        &0u32,
+        &None,
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &soroban_sdk::Vec::new(&env),
+    );
+
+    client.reject_course(&admin, &course_id, &String::from_str(&env, "SPAM"));
+    // Rejected is terminal: approval must never resurrect the course.
+    client.approve_course(&admin, &course_id);
+}
+
+#[test]
+#[should_panic(expected = "course is not available for enrollment")]
+fn test_rejected_course_cannot_be_enrolled_in() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    let course_id = String::from_str(&env, "COURSE-REJECT-ENROLL");
+    client.register_course(
+        &instructor,
+        &course_id,
+        &100_000_000,
+        &token_id,
+        &0u32,
+        &None,
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &soroban_sdk::Vec::new(&env),
+    );
+    env.ledger().with_mut(|l| {
+        l.sequence_number += 1;
+    });
+    client.reject_course(&admin, &course_id, &String::from_str(&env, "SPAM"));
+
+    client.enroll(&student, &course_id);
+}
