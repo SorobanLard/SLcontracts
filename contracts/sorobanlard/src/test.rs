@@ -1898,6 +1898,55 @@ fn test_update_treasury_same_address_rejected() {
 }
 
 // ============================================================
+// ISSUE #298 — update_treasury requires both admin signatures
+// ============================================================
+
+#[test]
+#[should_panic(expected = "unauthorized: requires both admin signatures")]
+fn test_update_treasury_rejects_single_admin_signing_twice() {
+    // Passing the same admin address for both signer slots must be rejected —
+    // a single admin cannot satisfy the two-signature requirement alone.
+    let (env, contract_id, _token_id, admin, _sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let new_treasury = Address::generate(&env);
+    client.update_treasury(&admin, &admin, &new_treasury);
+}
+
+#[test]
+#[should_panic(expected = "unauthorized: requires both admin signatures")]
+fn test_update_treasury_rejects_non_admin_second_signer() {
+    // The second signer must be the registered SecondaryAdmin — an arbitrary
+    // address (even though it signs via mock_all_auths) must be rejected.
+    let (env, contract_id, _token_id, admin, _sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let not_an_admin = Address::generate(&env);
+    let new_treasury = Address::generate(&env);
+    client.update_treasury(&admin, &not_an_admin, &new_treasury);
+}
+
+#[test]
+fn test_update_treasury_accepts_both_admin_signatures_either_order() {
+    // Both valid orderings of (Admin, SecondaryAdmin) must be accepted.
+    let (env, contract_id, _token_id, admin, sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    // (admin, sec_admin) order
+    let new_treasury_1 = Address::generate(&env);
+    client.update_treasury(&admin, &sec_admin, &new_treasury_1);
+
+    // Advance past the pending-update delay so a fresh update can be queued cleanly.
+    env.ledger().with_mut(|l| {
+        l.sequence_number += 200;
+    });
+
+    // (sec_admin, admin) order — reversed, must also be accepted
+    let new_treasury_2 = Address::generate(&env);
+    client.update_treasury(&sec_admin, &admin, &new_treasury_2);
+}
+
+// ============================================================
 // INPUT LENGTH VALIDATION TESTS (#20)
 // ============================================================
 
