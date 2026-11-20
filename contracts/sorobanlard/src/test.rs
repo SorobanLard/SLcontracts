@@ -14119,3 +14119,125 @@ fn test_admin_operations_resume_after_expiry_cleared() {
     // Should not panic — admin role is no longer bound by a cleared expiry.
     client.approve_course(&admin, &String::from_str(&env, "COURSE-EXP-2"));
 }
+
+// ============================================================
+// UPGRADE TIMELOCK TESTS (#253)
+// ============================================================
+
+#[test]
+fn test_propose_upgrade_sets_timelocked_effective_ledger() {
+    let (env, contract_id, _token_id, admin, sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let proposed_at = env.ledger().sequence();
+    let new_hash = BytesN::from_array(&env, &[7u8; 32]);
+    client.propose_upgrade(&admin, &sec_admin, &new_hash);
+
+    let timelock = client.get_upgrade_timelock();
+    assert_eq!(timelock, SorobanLardContract::MIN_UPGRADE_TIMELOCK_LEDGERS);
+
+    let pending: PendingUpgrade = env.as_contract(&contract_id, || {
+        env.storage()
+            .instance()
+            .get(&DataKey::PendingUpgrade)
+            .unwrap()
+    });
+    assert_eq!(pending.new_wasm_hash, new_hash);
+    assert_eq!(pending.proposed_at_ledger, proposed_at);
+    assert_eq!(pending.effective_ledger, proposed_at + timelock);
+}
+
+#[test]
+#[should_panic(expected = "unauthorized: requires both admin signatures")]
+fn test_propose_upgrade_requires_both_admins() {
+    let (env, contract_id, _token_id, admin, _sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let random = Address::generate(&env);
+    client.propose_upgrade(&admin, &random, &BytesN::from_array(&env, &[7u8; 32]));
+}
+
+#[test]
+#[should_panic(expected = "upgrade time-lock has not elapsed")]
+fn test_upgrade_contract_fails_before_timelock_elapses() {
+    let (env, contract_id, _token_id, admin, sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    client.propose_upgrade(&admin, &sec_admin, &BytesN::from_array(&env, &[7u8; 32]));
+
+    let timelock = client.get_upgrade_timelock();
+    // Advance to one ledger short of the effective ledger.
+    env.ledger().with_mut(|l| {
+        l.sequence_number += timelock - 1;
+    });
+
+    client.upgrade_contract(&admin, &sec_admin);
+}
+
+#[test]
+#[should_panic(expected = "no pending upgrade")]
+fn test_upgrade_contract_fails_without_pending_proposal() {
+    let (env, contract_id, _token_id, admin, sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    client.upgrade_contract(&admin, &sec_admin);
+}
+
+#[test]
+fn test_cancel_upgrade_removes_pending_proposal() {
+    let (env, contract_id, _token_id, admin, sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    client.propose_upgrade(&admin, &sec_admin, &BytesN::from_array(&env, &[7u8; 32]));
+    client.cancel_upgrade(&admin, &sec_admin);
+
+    let has_pending: bool = env.as_contract(&contract_id, || {
+        env.storage()
+            .instance()
+            .get::<DataKey, PendingUpgrade>(&DataKey::PendingUpgrade)
+            .is_some()
+    });
+    assert!(
+        !has_pending,
+        "cancel_upgrade must remove the pending proposal"
+    );
+}
+
+#[test]
+#[should_panic(expected = "no pending upgrade")]
+fn test_cancel_upgrade_fails_without_pending_proposal() {
+    let (env, contract_id, _token_id, admin, sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    client.cancel_upgrade(&admin, &sec_admin);
+}
+
+#[test]
+fn test_reproposing_upgrade_resets_timelock() {
+    let (env, contract_id, _token_id, admin, sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    client.propose_upgrade(&admin, &sec_admin, &BytesN::from_array(&env, &[1u8; 32]));
+    let timelock = client.get_upgrade_timelock();
+
+    // Advance partway through the window, then propose a different hash —
+    // this must replace the pending proposal and reset the time-lock rather
+    // than stacking on top of the first one.
+    env.ledger().with_mut(|l| {
+        l.sequence_number += timelock - 1;
+    });
+    let second_hash = BytesN::from_array(&env, &[2u8; 32]);
+    client.propose_upgrade(&admin, &sec_admin, &second_hash);
+
+    let pending: PendingUpgrade = env.as_contract(&contract_id, || {
+        env.storage()
+            .instance()
+            .get(&DataKey::PendingUpgrade)
+            .unwrap()
+    });
+    assert_eq!(pending.new_wasm_hash, second_hash);
+    assert_eq!(
+        pending.effective_ledger,
+        pending.proposed_at_ledger + timelock
+    );
+}
