@@ -6447,6 +6447,64 @@ fn test_refund_window_zero_rejects_all_requests() {
 }
 
 // ============================================================
+// ISSUE #306 — refund boundary: within vs outside refund_window_ledgers
+// ============================================================
+
+#[test]
+fn test_refund_boundary_within_vs_outside_refund_window_ledgers() {
+    // Exercises both sides of the refund_window_ledgers boundary against two
+    // independent enrollments under the same admin-configured window, so the
+    // "within" and "outside" outcomes are verified in a single scenario.
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    let asset_client = token::StellarAssetClient::new(&env, &token_id);
+
+    let window = 50u32;
+    client.update_refund_window(&admin, &window);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-BOUNDARY-306",
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-BOUNDARY-306");
+
+    // --- Student A: requests refund WITHIN the window ---
+    let student_a = Address::generate(&env);
+    asset_client.mint(&student_a, &1_000_000_000);
+    client.enroll(&student_a, &course_id);
+
+    env.ledger().with_mut(|l| {
+        l.sequence_number += window - 1; // elapsed < window
+    });
+    client.request_refund(&student_a, &course_id);
+    let request_a = client.get_refund_request(&student_a, &course_id).unwrap();
+    assert_eq!(request_a.status, RefundStatus::Pending);
+
+    // --- Student B: requests refund OUTSIDE the window (same course/window) ---
+    let student_b = Address::generate(&env);
+    asset_client.mint(&student_b, &1_000_000_000);
+    client.enroll(&student_b, &course_id);
+
+    env.ledger().with_mut(|l| {
+        l.sequence_number += window + 1; // elapsed > window
+    });
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.request_refund(&student_b, &course_id);
+    }));
+    assert!(
+        result.is_err(),
+        "a refund request submitted outside refund_window_ledgers must be rejected"
+    );
+    // The outside-window attempt must not have created a request record.
+    assert!(client.get_refund_request(&student_b, &course_id).is_none());
+}
+
+// ============================================================
 // FEATURE: get_course() extends TTL on every read
 // ============================================================
 
