@@ -10417,6 +10417,40 @@ fn test_update_default_fee_accepts_different_value() {
 }
 
 // ============================================================
+// ISSUE #299 — update_default_fee percentage boundary values
+// ============================================================
+
+#[test]
+fn test_update_default_fee_accepts_zero_boundary() {
+    // 0% is a valid fee percentage (the lower boundary) and must be accepted.
+    let (env, contract_id, _token_id, admin, _sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    client.update_default_fee(&admin, &0u32);
+    assert_eq!(client.get_platform_fee(&admin), 0u32);
+}
+
+#[test]
+fn test_update_default_fee_accepts_hundred_boundary() {
+    // 100% is a valid fee percentage (the upper boundary) and must be accepted.
+    let (env, contract_id, _token_id, admin, _sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    client.update_default_fee(&admin, &100u32);
+    assert_eq!(client.get_platform_fee(&admin), 100u32);
+}
+
+#[test]
+#[should_panic(expected = "fee percentage cannot exceed 100")]
+fn test_update_default_fee_rejects_101_above_boundary() {
+    // 101% exceeds the maximum allowed and must panic before any state is written.
+    let (env, contract_id, _token_id, admin, _sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    client.update_default_fee(&admin, &101u32);
+}
+
+// ============================================================
 // ISSUE #176 — transfer_admin cooldown between consecutive calls
 // ============================================================
 
