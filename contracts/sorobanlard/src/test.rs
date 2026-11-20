@@ -14283,3 +14283,69 @@ fn test_course_below_high_value_threshold_approves_with_single_admin() {
     let course = client.get_course(&course_id).unwrap();
     assert_eq!(course.status, CourseStatus::Active);
 }
+
+// ============================================================
+// ISSUE 255: ARCHIVE COOLDOWN RE-REGISTRATION (ARCHIVE_COOLDOWN_LEDGERS)
+// ============================================================
+
+#[test]
+fn test_reregister_succeeds_once_cooldown_fully_elapses() {
+    let (env, contract_id, token_id, admin, sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    register_and_approve_course(
+        &env, &client, &token_id, &admin, &instructor, "COURSE-COOLDOWN-REREG", 100_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-COOLDOWN-REREG");
+
+    client.pause_course(&admin, &course_id);
+    client.archive_course(&admin, &sec_admin, &course_id, &None);
+
+    let archived_at = client
+        .get_course(&course_id)
+        .unwrap()
+        .archived_at_ledger
+        .unwrap();
+
+    // One ledger before the boundary the course ID must still be reserved.
+    env.ledger().with_mut(|l| {
+        l.sequence_number = archived_at + SorobanLardContract::ARCHIVE_COOLDOWN_LEDGERS - 1;
+    });
+    let still_blocked = client.try_register_course(
+        &instructor,
+        &course_id,
+        &100_000_000,
+        &token_id,
+        &0u32,
+        &None,
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &soroban_sdk::Vec::new(&env),
+    );
+    assert!(
+        still_blocked.is_err(),
+        "the ledger just before the cooldown boundary must still be within the cooldown"
+    );
+
+    // Exactly at the boundary (current_ledger == archived_at + COOLDOWN),
+    // the cooldown has fully elapsed and re-registration must succeed,
+    // starting a fresh Pending course under the same ID.
+    env.ledger().with_mut(|l| {
+        l.sequence_number = archived_at + SorobanLardContract::ARCHIVE_COOLDOWN_LEDGERS;
+    });
+    client.register_course(
+        &instructor,
+        &course_id,
+        &200_000_000,
+        &token_id,
+        &0u32,
+        &None,
+        &BytesN::from_array(&env, &[2u8; 32]),
+        &soroban_sdk::Vec::new(&env),
+    );
+
+    let reregistered = client.get_course(&course_id).unwrap();
+    assert_eq!(reregistered.status, CourseStatus::Pending);
+    assert_eq!(reregistered.price, 200_000_000);
+    assert_eq!(reregistered.archived_at_ledger, None);
+    assert_eq!(reregistered.total_enrollments, 0);
+}
