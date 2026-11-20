@@ -14044,3 +14044,62 @@ fn test_course_registered_event_payload() {
 
     assert_eq!(matched, 1, "expected exactly one course_registered event");
 }
+
+// ============================================================
+// DISPUTE_ESCALATED EVENT PAYLOAD TESTS (#324)
+// ============================================================
+
+/// #324 — escalate_to_arbitration() must emit a `dispute_escalated` event
+/// whose topic carries the course_id and whose payload is
+/// (caller, course_id, fee_per_case).
+#[test]
+fn test_dispute_escalated_event_payload() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let fee_per_case = 5_000_000i128;
+    let course_id_str = "COURSE-ARB-324";
+    client.set_arbitration_fee_config(&admin, &fee_per_case);
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        course_id_str,
+        1_000_000_000,
+    );
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+    let course_id = String::from_str(&env, course_id_str);
+    client.enroll(&student, &course_id);
+
+    client.escalate_to_arbitration(&student, &course_id);
+
+    let events = env.events().all();
+    let mut matched = 0u32;
+
+    for (contract, topics, data) in events.iter() {
+        if contract != contract_id {
+            continue;
+        }
+
+        let topic0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        if topic0 != Symbol::new(&env, "dispute_escalated") {
+            continue;
+        }
+
+        matched += 1;
+
+        let topic_course_id: String = topics.get(1).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(topic_course_id, course_id);
+
+        let (event_caller, event_course_id, event_fee): (Address, String, i128) =
+            data.try_into_val(&env).unwrap();
+        assert_eq!(event_caller, student);
+        assert_eq!(event_course_id, course_id);
+        assert_eq!(event_fee, fee_per_case);
+    }
+
+    assert_eq!(matched, 1, "expected exactly one dispute_escalated event");
+}
