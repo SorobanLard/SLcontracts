@@ -13997,6 +13997,100 @@ fn test_current_wasm_hash_none_before_first_upgrade() {
 }
 
 // ============================================================
+// ISSUE #313 — freeze_instructor / unfreeze_instructor
+// ============================================================
+
+#[test]
+fn test_freeze_instructor_pauses_active_courses() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "FREEZE-PAUSE-COURSE",
+        100_000_000,
+    );
+
+    let course_before = client
+        .get_course(&String::from_str(&env, "FREEZE-PAUSE-COURSE"))
+        .unwrap();
+    assert_eq!(course_before.status, CourseStatus::Active);
+
+    client.freeze_instructor(&admin, &instructor);
+
+    let course_after = client
+        .get_course(&String::from_str(&env, "FREEZE-PAUSE-COURSE"))
+        .unwrap();
+    assert_eq!(course_after.status, CourseStatus::Paused);
+}
+
+#[test]
+fn test_unfreeze_instructor_does_not_auto_resume_paused_courses() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "UNFREEZE-NO-RESUME-COURSE",
+        100_000_000,
+    );
+
+    client.freeze_instructor(&admin, &instructor);
+    client.unfreeze_instructor(&admin, &instructor);
+    assert!(!client.is_instructor_frozen(&instructor));
+
+    // Unfreezing lifts the registration/enrollment block but must not silently
+    // re-activate courses the freeze paused — that requires an explicit resume.
+    let course = client
+        .get_course(&String::from_str(&env, "UNFREEZE-NO-RESUME-COURSE"))
+        .unwrap();
+    assert_eq!(course.status, CourseStatus::Paused);
+}
+
+#[test]
+fn test_unfreeze_instructor_allows_registering_courses_again() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    client.freeze_instructor(&admin, &instructor);
+    assert!(client
+        .try_register_course(
+            &instructor,
+            &String::from_str(&env, "FROZEN-BLOCKED-COURSE"),
+            &100_000_000i128,
+            &token_id,
+            &0u32,
+            &None,
+            &BytesN::from_array(&env, &[1u8; 32]),
+            &soroban_sdk::Vec::new(&env),
+        )
+        .is_err());
+
+    client.unfreeze_instructor(&admin, &instructor);
+    client.register_course(
+        &instructor,
+        &String::from_str(&env, "UNFROZEN-ALLOWED-COURSE"),
+        &100_000_000i128,
+        &token_id,
+        &0u32,
+        &None,
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &soroban_sdk::Vec::new(&env),
+    );
+    assert!(client
+        .get_course(&String::from_str(&env, "UNFROZEN-ALLOWED-COURSE"))
+        .is_some());
+}
+
+// ============================================================
 // ISSUE #312 — block_student / unblock_student
 // ============================================================
 
