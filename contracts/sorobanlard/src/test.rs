@@ -13995,3 +13995,417 @@ fn test_current_wasm_hash_none_before_first_upgrade() {
 
     assert_eq!(client.get_current_wasm_hash(), None);
 }
+
+// ============================================================
+// ADMIN EXPIRY TESTS (#254)
+// ============================================================
+
+#[test]
+#[should_panic(expected = "expiry must be in the future")]
+fn test_set_admin_expiry_rejects_non_future_ledger() {
+    let (env, contract_id, _token_id, admin, sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let current = env.ledger().sequence();
+    client.set_admin_expiry(&admin, &sec_admin, &Some(current));
+}
+
+#[test]
+fn test_set_admin_expiry_and_get_roundtrip() {
+    let (env, contract_id, _token_id, admin, sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let expires_at = env.ledger().sequence() + 100;
+    client.set_admin_expiry(&admin, &sec_admin, &Some(expires_at));
+    assert_eq!(client.get_admin_expiry(), Some(expires_at));
+
+    // Clearing the expiry removes the block entirely.
+    client.set_admin_expiry(&admin, &sec_admin, &None);
+    assert_eq!(client.get_admin_expiry(), None);
+}
+
+#[test]
+#[should_panic(expected = "admin role has expired")]
+fn test_admin_expiry_blocks_single_admin_operation() {
+    let (env, contract_id, token_id, admin, sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let expires_at = env.ledger().sequence() + 5;
+    client.set_admin_expiry(&admin, &sec_admin, &Some(expires_at));
+
+    client.register_course(
+        &instructor,
+        &String::from_str(&env, "COURSE-EXP-1"),
+        &100_000_000i128,
+        &token_id,
+        &0u32,
+        &None,
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &soroban_sdk::Vec::new(&env),
+    );
+
+    // Advance the ledger to/past the configured expiry.
+    env.ledger().with_mut(|l| {
+        l.sequence_number = expires_at;
+    });
+
+    // approve_course is a single-admin operation and must now be blocked.
+    client.approve_course(&admin, &String::from_str(&env, "COURSE-EXP-1"));
+}
+
+#[test]
+#[should_panic(expected = "admin role has expired")]
+fn test_admin_expiry_blocks_multi_admin_operation() {
+    let (env, contract_id, _token_id, admin, sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let expires_at = env.ledger().sequence() + 5;
+    client.set_admin_expiry(&admin, &sec_admin, &Some(expires_at));
+
+    env.ledger().with_mut(|l| {
+        l.sequence_number = expires_at;
+    });
+
+    // set_admin_expiry itself is a multi-admin operation and must now be
+    // blocked once the previously configured expiry has passed.
+    client.set_admin_expiry(&admin, &sec_admin, &Some(expires_at + 100));
+}
+
+#[test]
+#[should_panic(expected = "admin role has expired")]
+fn test_admin_expiry_blocks_block_student() {
+    let (env, contract_id, _token_id, admin, sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    let expires_at = env.ledger().sequence() + 5;
+    client.set_admin_expiry(&admin, &sec_admin, &Some(expires_at));
+
+    env.ledger().with_mut(|l| {
+        l.sequence_number = expires_at;
+    });
+
+    client.block_student(&admin, &student);
+}
+
+#[test]
+fn test_admin_operations_resume_after_expiry_cleared() {
+    let (env, contract_id, token_id, admin, sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let expires_at = env.ledger().sequence() + 5;
+    client.set_admin_expiry(&admin, &sec_admin, &Some(expires_at));
+
+    // Clear the expiry before it takes effect — admin ops must keep working.
+    client.set_admin_expiry(&admin, &sec_admin, &None);
+
+    env.ledger().with_mut(|l| {
+        l.sequence_number = expires_at + 10;
+    });
+
+    client.register_course(
+        &instructor,
+        &String::from_str(&env, "COURSE-EXP-2"),
+        &100_000_000i128,
+        &token_id,
+        &0u32,
+        &None,
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &soroban_sdk::Vec::new(&env),
+    );
+    env.ledger().with_mut(|l| {
+        l.sequence_number += 1;
+    });
+    // Should not panic — admin role is no longer bound by a cleared expiry.
+    client.approve_course(&admin, &String::from_str(&env, "COURSE-EXP-2"));
+}
+
+// ============================================================
+// UPGRADE TIMELOCK TESTS (#253)
+// ============================================================
+
+#[test]
+fn test_propose_upgrade_sets_timelocked_effective_ledger() {
+    let (env, contract_id, _token_id, admin, sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let proposed_at = env.ledger().sequence();
+    let new_hash = BytesN::from_array(&env, &[7u8; 32]);
+    client.propose_upgrade(&admin, &sec_admin, &new_hash);
+
+    let timelock = client.get_upgrade_timelock();
+    assert_eq!(timelock, SorobanLardContract::MIN_UPGRADE_TIMELOCK_LEDGERS);
+
+    let pending: PendingUpgrade = env.as_contract(&contract_id, || {
+        env.storage()
+            .instance()
+            .get(&DataKey::PendingUpgrade)
+            .unwrap()
+    });
+    assert_eq!(pending.new_wasm_hash, new_hash);
+    assert_eq!(pending.proposed_at_ledger, proposed_at);
+    assert_eq!(pending.effective_ledger, proposed_at + timelock);
+}
+
+#[test]
+#[should_panic(expected = "unauthorized: requires both admin signatures")]
+fn test_propose_upgrade_requires_both_admins() {
+    let (env, contract_id, _token_id, admin, _sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let random = Address::generate(&env);
+    client.propose_upgrade(&admin, &random, &BytesN::from_array(&env, &[7u8; 32]));
+}
+
+#[test]
+#[should_panic(expected = "upgrade time-lock has not elapsed")]
+fn test_upgrade_contract_fails_before_timelock_elapses() {
+    let (env, contract_id, _token_id, admin, sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    client.propose_upgrade(&admin, &sec_admin, &BytesN::from_array(&env, &[7u8; 32]));
+
+    let timelock = client.get_upgrade_timelock();
+    // Advance to one ledger short of the effective ledger.
+    env.ledger().with_mut(|l| {
+        l.sequence_number += timelock - 1;
+    });
+
+    client.upgrade_contract(&admin, &sec_admin);
+}
+
+#[test]
+#[should_panic(expected = "no pending upgrade")]
+fn test_upgrade_contract_fails_without_pending_proposal() {
+    let (env, contract_id, _token_id, admin, sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    client.upgrade_contract(&admin, &sec_admin);
+}
+
+#[test]
+fn test_cancel_upgrade_removes_pending_proposal() {
+    let (env, contract_id, _token_id, admin, sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    client.propose_upgrade(&admin, &sec_admin, &BytesN::from_array(&env, &[7u8; 32]));
+    client.cancel_upgrade(&admin, &sec_admin);
+
+    let has_pending: bool = env.as_contract(&contract_id, || {
+        env.storage()
+            .instance()
+            .get::<DataKey, PendingUpgrade>(&DataKey::PendingUpgrade)
+            .is_some()
+    });
+    assert!(
+        !has_pending,
+        "cancel_upgrade must remove the pending proposal"
+    );
+}
+
+#[test]
+#[should_panic(expected = "no pending upgrade")]
+fn test_cancel_upgrade_fails_without_pending_proposal() {
+    let (env, contract_id, _token_id, admin, sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    client.cancel_upgrade(&admin, &sec_admin);
+}
+
+#[test]
+fn test_reproposing_upgrade_resets_timelock() {
+    let (env, contract_id, _token_id, admin, sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    client.propose_upgrade(&admin, &sec_admin, &BytesN::from_array(&env, &[1u8; 32]));
+    let timelock = client.get_upgrade_timelock();
+
+    // Advance partway through the window, then propose a different hash —
+    // this must replace the pending proposal and reset the time-lock rather
+    // than stacking on top of the first one.
+    env.ledger().with_mut(|l| {
+        l.sequence_number += timelock - 1;
+    });
+    let second_hash = BytesN::from_array(&env, &[2u8; 32]);
+    client.propose_upgrade(&admin, &sec_admin, &second_hash);
+
+    let pending: PendingUpgrade = env.as_contract(&contract_id, || {
+        env.storage()
+            .instance()
+            .get(&DataKey::PendingUpgrade)
+            .unwrap()
+    });
+    assert_eq!(pending.new_wasm_hash, second_hash);
+    assert_eq!(
+        pending.effective_ledger,
+        pending.proposed_at_ledger + timelock
+    );
+}
+
+// ============================================================
+// ENROLLMENT CIRCUIT BREAKER TESTS (#252)
+// ============================================================
+
+#[test]
+#[should_panic(
+    expected = "course auto-paused after 5 consecutive enrollment failures: circuit breaker tripped"
+)]
+fn test_circuit_breaker_trips_at_threshold() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &1_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-CB-1",
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-CB-1");
+
+    // Simulate CIRCUIT_BREAKER_THRESHOLD prior consecutive failed enrollment
+    // attempts by writing the per-course failure counter directly, matching
+    // how enroll_internal() pre-increments it before each attempted transfer.
+    env.as_contract(&contract_id, || {
+        env.storage().persistent().set(
+            &DataKey::CourseFailureCount(course_id.clone()),
+            &SorobanLardContract::CIRCUIT_BREAKER_THRESHOLD,
+        );
+    });
+
+    // The next enroll() must auto-pause the course and panic before
+    // attempting any token transfer.
+    client.enroll(&student, &course_id);
+}
+
+#[test]
+fn test_circuit_breaker_pauses_course_when_success_crosses_threshold() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &1_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-CB-2",
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-CB-2");
+
+    // CIRCUIT_BREAKER_THRESHOLD - 1 prior failures: the pre-increment inside
+    // this enroll() call pushes the counter to exactly THRESHOLD, which
+    // enroll_internal() treats as crossing the trip point even though this
+    // particular transfer succeeds — the course is auto-paused for future
+    // attempts despite the current call completing.
+    env.as_contract(&contract_id, || {
+        env.storage().persistent().set(
+            &DataKey::CourseFailureCount(course_id.clone()),
+            &(SorobanLardContract::CIRCUIT_BREAKER_THRESHOLD - 1),
+        );
+    });
+
+    client.enroll(&student, &course_id);
+
+    let course = client.get_course(&course_id).unwrap();
+    assert_eq!(
+        course.status,
+        CourseStatus::Paused,
+        "crossing the threshold on a successful call must still auto-pause the course"
+    );
+
+    let failure_count: u32 = env.as_contract(&contract_id, || {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CourseFailureCount(course_id.clone()))
+            .unwrap_or(0)
+    });
+    assert_eq!(
+        failure_count, 0,
+        "the counter is reset on the successful transfer regardless of the pause"
+    );
+}
+
+#[test]
+fn test_circuit_breaker_does_not_trip_below_threshold() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &1_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-CB-3",
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-CB-3");
+
+    // Two failures short of the threshold — the pre-increment inside this
+    // enroll() call lands at THRESHOLD - 1, so enroll() must succeed
+    // normally and the course must remain Active.
+    env.as_contract(&contract_id, || {
+        env.storage().persistent().set(
+            &DataKey::CourseFailureCount(course_id.clone()),
+            &(SorobanLardContract::CIRCUIT_BREAKER_THRESHOLD - 2),
+        );
+    });
+
+    client.enroll(&student, &course_id);
+
+    let course = client.get_course(&course_id).unwrap();
+    assert_eq!(course.status, CourseStatus::Active);
+}
+
+#[test]
+fn test_circuit_breaker_resets_failure_count_on_successful_enrollment() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &1_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-CB-4",
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-CB-4");
+
+    env.as_contract(&contract_id, || {
+        env.storage().persistent().set(
+            &DataKey::CourseFailureCount(course_id.clone()),
+            &(SorobanLardContract::CIRCUIT_BREAKER_THRESHOLD - 2),
+        );
+    });
+
+    client.enroll(&student, &course_id);
+
+    let failure_count: u32 = env.as_contract(&contract_id, || {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CourseFailureCount(course_id.clone()))
+            .unwrap_or(0)
+    });
+    assert_eq!(
+        failure_count, 0,
+        "a successful enroll() must reset the per-course failure counter"
+    );
+}

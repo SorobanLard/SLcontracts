@@ -166,6 +166,14 @@ Every push and pull request runs the CI workflow defined in
 `cargo test --workspace` and caches the cargo registry and `target`
 directories to keep runs fast.
 
+The same workflow also runs a separate `clippy` job
+([`.github/workflows/ci.yml:26-34`](.github/workflows/ci.yml)) with
+`cargo clippy --all-targets --all-features -- -D warnings`, so any clippy
+warning fails CI the same way a test failure does — there is no warnings-only
+state. This enforces the lint rule above ("Lint (must be clean)") at the CI
+level, not just locally, and is why `cargo clippy --all-targets -- -D
+warnings` must already be clean before you push.
+
 Maintainers should configure branch protection on `main` so the CI check is
 **required for merge**. This is applied in the repository settings (Settings →
 Branches → branch protection rules) and is not part of the code in this repo.
