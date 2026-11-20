@@ -13995,3 +13995,49 @@ fn test_current_wasm_hash_none_before_first_upgrade() {
 
     assert_eq!(client.get_current_wasm_hash(), None);
 }
+
+// ============================================================
+// ISSUE #297 — transfer_admin requires both admin signatures
+// ============================================================
+
+#[test]
+#[should_panic(expected = "unauthorized: requires both admin signatures")]
+fn test_transfer_admin_rejects_single_caller_passed_twice() {
+    let (env, contract_id, _token_id, admin, _sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    // Passing the same caller twice must be rejected even though it is a
+    // real admin — both signatures must come from distinct admin1/admin2.
+    let new_admin = Address::generate(&env);
+    let new_sec_admin = Address::generate(&env);
+    client.transfer_admin(&admin, &admin, &new_admin, &new_sec_admin);
+}
+
+#[test]
+#[should_panic(expected = "unauthorized: requires both admin signatures")]
+fn test_transfer_admin_rejects_non_admin_second_caller() {
+    let (env, contract_id, _token_id, admin, _sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    // admin1 is the real admin, but admin2 is an unrelated address instead
+    // of the secondary admin — must be rejected.
+    let random = Address::generate(&env);
+    let new_admin = Address::generate(&env);
+    let new_sec_admin = Address::generate(&env);
+    client.transfer_admin(&admin, &random, &new_admin, &new_sec_admin);
+}
+
+#[test]
+fn test_transfer_admin_succeeds_with_both_signatures_either_order() {
+    let (env, contract_id, _token_id, admin, sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    // admin1 = secondary_admin, admin2 = admin — order must not matter as
+    // long as both real admins are present.
+    let new_admin = Address::generate(&env);
+    let new_sec_admin = Address::generate(&env);
+    client.transfer_admin(&sec_admin, &admin, &new_admin, &new_sec_admin);
+
+    // The proposal was accepted — new admins can now complete the handover.
+    client.accept_admin(&new_admin, &new_sec_admin);
+}
