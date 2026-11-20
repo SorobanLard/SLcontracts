@@ -14103,3 +14103,59 @@ fn test_dispute_escalated_event_payload() {
 
     assert_eq!(matched, 1, "expected exactly one dispute_escalated event");
 }
+
+// ============================================================
+// MAX_CERTIFICATES CAP ENFORCEMENT TESTS (#321)
+// ============================================================
+
+/// #321 — issue_certificate() must allow issuance up to max_certificates
+/// and panic once the cap is reached.
+#[test]
+#[should_panic(expected = "course has reached maximum certificate issuance limit")]
+fn test_issue_certificate_enforces_max_certificates_cap() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let course_id_str = "COURSE-CAP-321";
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        course_id_str,
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, course_id_str);
+
+    // Cap the course to exactly one certificate.
+    client.set_max_certificates(&admin, &course_id, &Some(1u32));
+
+    let student_one = Address::generate(&env);
+    enroll_and_certify(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &student_one,
+        course_id_str,
+        "CERT-CAP-321-A",
+    );
+
+    // First issuance succeeds and consumes the only slot.
+    let course = client.get_course(&course_id).unwrap();
+    assert_eq!(course.certificates_issued, 1);
+    assert_eq!(course.max_certificates, Some(1u32));
+
+    // Second issuance for a different student must panic: the cap is reached.
+    let student_two = Address::generate(&env);
+    enroll_and_certify(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &student_two,
+        course_id_str,
+        "CERT-CAP-321-B",
+    );
+}
