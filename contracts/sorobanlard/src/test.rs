@@ -14159,3 +14159,75 @@ fn test_issue_certificate_enforces_max_certificates_cap() {
         "CERT-CAP-321-B",
     );
 }
+
+// ============================================================
+// COURSECERTIFICATES INDEX GROWTH TESTS (#320)
+// ============================================================
+
+/// #320 — the CourseCertificates index must grow by one entry per
+/// certificate issued for a course, in issuance order.
+#[test]
+fn test_course_certificates_index_grows_per_issuance() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let course_id_str = "COURSE-IDX-320";
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        course_id_str,
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, course_id_str);
+
+    assert_eq!(client.get_course_certificates(&course_id).len(), 0);
+
+    let student_one = Address::generate(&env);
+    enroll_and_certify(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &student_one,
+        course_id_str,
+        "CERT-IDX-320-A",
+    );
+    assert_eq!(client.get_course_certificates(&course_id).len(), 1);
+    assert_eq!(
+        client.get_course_certificates(&course_id).get(0).unwrap(),
+        String::from_str(&env, "CERT-IDX-320-A")
+    );
+
+    let student_two = Address::generate(&env);
+    enroll_and_certify(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &student_two,
+        course_id_str,
+        "CERT-IDX-320-B",
+    );
+    assert_eq!(client.get_course_certificates(&course_id).len(), 2);
+    assert_eq!(
+        client.get_course_certificates(&course_id).get(1).unwrap(),
+        String::from_str(&env, "CERT-IDX-320-B")
+    );
+
+    let student_three = Address::generate(&env);
+    enroll_and_certify(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &student_three,
+        course_id_str,
+        "CERT-IDX-320-C",
+    );
+    let final_index = client.get_course_certificates(&course_id);
+    assert_eq!(final_index.len(), 3);
+    assert_eq!(final_index.get(2).unwrap(), String::from_str(&env, "CERT-IDX-320-C"));
+}
