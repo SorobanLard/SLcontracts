@@ -14094,3 +14094,93 @@ fn test_pause_course_by_unrelated_caller_rejected() {
     client.pause_course(&stranger, &course_id);
 }
 
+// ============================================================
+// ISSUE #296 — unpause_course caller distinction: instructor vs admin
+// ============================================================
+
+#[test]
+fn test_unpause_course_by_instructor_succeeds() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let course_id = String::from_str(&env, "COURSE-UNPAUSE-BY-INSTRUCTOR");
+    register_and_approve_course(
+        &env, &client, &token_id, &admin, &instructor, "COURSE-UNPAUSE-BY-INSTRUCTOR", 100_000_000,
+    );
+
+    client.pause_course(&instructor, &course_id);
+    client.unpause_course(&instructor, &course_id);
+    let course = client.get_course(&course_id).unwrap();
+    assert_eq!(course.status, CourseStatus::Active);
+}
+
+#[test]
+fn test_unpause_course_by_admin_succeeds() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let course_id = String::from_str(&env, "COURSE-UNPAUSE-BY-ADMIN");
+    register_and_approve_course(
+        &env, &client, &token_id, &admin, &instructor, "COURSE-UNPAUSE-BY-ADMIN", 100_000_000,
+    );
+
+    client.pause_course(&instructor, &course_id);
+    client.unpause_course(&admin, &course_id);
+    let course = client.get_course(&course_id).unwrap();
+    assert_eq!(course.status, CourseStatus::Active);
+}
+
+#[test]
+#[should_panic(expected = "unauthorized")]
+fn test_unpause_course_by_unrelated_caller_rejected() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let course_id = String::from_str(&env, "COURSE-UNPAUSE-UNRELATED");
+    register_and_approve_course(
+        &env, &client, &token_id, &admin, &instructor, "COURSE-UNPAUSE-UNRELATED", 100_000_000,
+    );
+
+    client.pause_course(&instructor, &course_id);
+
+    let stranger = Address::generate(&env);
+    client.unpause_course(&stranger, &course_id);
+}
+
+#[test]
+#[should_panic(expected = "instructor is frozen")]
+fn test_unpause_course_by_frozen_instructor_rejected() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let course_id = String::from_str(&env, "COURSE-UNPAUSE-FROZEN");
+    register_and_approve_course(
+        &env, &client, &token_id, &admin, &instructor, "COURSE-UNPAUSE-FROZEN", 100_000_000,
+    );
+
+    // freeze_instructor() auto-pauses the instructor's courses.
+    client.freeze_instructor(&admin, &instructor);
+    let course = client.get_course(&course_id).unwrap();
+    assert_eq!(course.status, CourseStatus::Paused);
+
+    // A frozen instructor must not be able to self-unpause.
+    client.unpause_course(&instructor, &course_id);
+}
+
+#[test]
+fn test_unpause_course_by_admin_overrides_frozen_instructor() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let course_id = String::from_str(&env, "COURSE-UNPAUSE-FROZEN-ADMIN");
+    register_and_approve_course(
+        &env, &client, &token_id, &admin, &instructor, "COURSE-UNPAUSE-FROZEN-ADMIN", 100_000_000,
+    );
+
+    client.freeze_instructor(&admin, &instructor);
+
+    // Admin is exempt from the frozen-instructor restriction.
+    client.unpause_course(&admin, &course_id);
+    let course = client.get_course(&course_id).unwrap();
+    assert_eq!(course.status, CourseStatus::Active);
+}
