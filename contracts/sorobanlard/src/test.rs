@@ -13995,3 +13995,72 @@ fn test_current_wasm_hash_none_before_first_upgrade() {
 
     assert_eq!(client.get_current_wasm_hash(), None);
 }
+
+// ============================================================
+// ISSUE 293: FREE COURSE ENROLLMENT (price = 0)
+// ============================================================
+
+#[test]
+fn test_batch_enroll_free_courses_no_token_transfer() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    let token_client = token::Client::new(&env, &token_id);
+    let starting_balance = token_client.balance(&student);
+
+    register_and_approve_course(
+        &env, &client, &token_id, &admin, &instructor, "COURSE-FREE-BATCH-1", 0,
+    );
+    register_and_approve_course(
+        &env, &client, &token_id, &admin, &instructor, "COURSE-FREE-BATCH-2", 0,
+    );
+
+    let course_ids = soroban_sdk::vec![
+        &env,
+        String::from_str(&env, "COURSE-FREE-BATCH-1"),
+        String::from_str(&env, "COURSE-FREE-BATCH-2"),
+    ];
+    client.batch_enroll(&student, &course_ids);
+
+    // No tokens should have moved for either free course.
+    assert_eq!(token_client.balance(&student), starting_balance);
+
+    for id in ["COURSE-FREE-BATCH-1", "COURSE-FREE-BATCH-2"] {
+        let course = client.get_course(&String::from_str(&env, id)).unwrap();
+        assert_eq!(course.total_earned, 0);
+        assert_eq!(course.active_enrollments, 1);
+        let enrollment = client
+            .get_enrollment(&student, &student, &String::from_str(&env, id))
+            .unwrap();
+        assert_eq!(enrollment.amount_paid, 0);
+        assert_eq!(enrollment.platform_amount, 0);
+        assert_eq!(enrollment.instructor_amount, 0);
+    }
+}
+
+#[test]
+fn test_free_course_completion_requires_no_payment_but_still_tracked() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    register_and_approve_course(
+        &env, &client, &token_id, &admin, &instructor, "COURSE-FREE-COMPLETE", 0,
+    );
+    let course_id = String::from_str(&env, "COURSE-FREE-COMPLETE");
+    client.enroll(&student, &course_id);
+
+    // Instructor's accrued earnings must stay at zero for a free course even
+    // after the enrollment is marked completed.
+    client.mark_completed(&admin, &student, &course_id, &None);
+
+    let enrollment = client
+        .get_enrollment(&student, &student, &course_id)
+        .unwrap();
+    assert!(enrollment.completed);
+    assert_eq!(enrollment.amount_paid, 0);
+
+    let instructor_earnings = client.get_instructor_earnings(&instructor, &token_id);
+    assert_eq!(instructor_earnings, 0);
+}
