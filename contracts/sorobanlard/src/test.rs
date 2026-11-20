@@ -13997,6 +13997,64 @@ fn test_current_wasm_hash_none_before_first_upgrade() {
 }
 
 // ============================================================
+// ISSUE #312 — block_student / unblock_student
+// ============================================================
+
+#[test]
+fn test_unblocked_student_can_enroll_after_unblock() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "UNBLOCK-STUDENT-COURSE",
+        100_000_000,
+    );
+
+    client.block_student(&admin, &student);
+    assert!(client
+        .try_enroll(&student, &String::from_str(&env, "UNBLOCK-STUDENT-COURSE"))
+        .is_err());
+
+    // Unblocking must restore the student's ability to enroll.
+    client.unblock_student(&admin, &student);
+    assert!(!client.is_student_blocked(&student));
+    client.enroll(&student, &String::from_str(&env, "UNBLOCK-STUDENT-COURSE"));
+}
+
+#[test]
+fn test_blocking_one_student_does_not_affect_another() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    let blocked_student = Address::generate(&env);
+    let other_student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&other_student, &100_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "SCOPED-BLOCK-COURSE",
+        100_000_000,
+    );
+
+    client.block_student(&admin, &blocked_student);
+    assert!(client.is_student_blocked(&blocked_student));
+    assert!(!client.is_student_blocked(&other_student));
+
+    // The unaffected student must still be able to enroll normally.
+    client.enroll(&other_student, &String::from_str(&env, "SCOPED-BLOCK-COURSE"));
+}
+
+// ============================================================
 // ISSUE #311 — update_max_courses_limit enforces the new cap
 // ============================================================
 
