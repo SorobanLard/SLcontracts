@@ -4840,6 +4840,87 @@ fn test_events_emitted_for_admin_operations() {
     assert_eq!(event_dest, destination);
 }
 
+// ============================================================
+// ISSUE #305 — re_enroll after refund
+// ============================================================
+
+#[test]
+#[should_panic(expected = "no prior enrollment found for this course")]
+fn test_re_enroll_after_approved_refund_fails() {
+    // Once an admin approves a refund, process_refund() archives the
+    // enrollment to history and removes the active Enrollment record
+    // entirely. re_enroll() looks up that active record (and additionally
+    // requires it be `completed`), so after a refund there is nothing left
+    // to re-enroll against — it must panic the same way a student with no
+    // prior enrollment at all would.
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &1_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-REENROLL-REFUND",
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-REENROLL-REFUND");
+
+    client.enroll(&student, &course_id);
+    client.request_refund(&student, &course_id);
+    client.process_refund(&admin, &student, &course_id, &true);
+
+    // No active enrollment remains — re_enroll must fail.
+    client.re_enroll(&student, &course_id);
+}
+
+#[test]
+fn test_re_enroll_after_rejected_refund_still_requires_completion() {
+    // A *rejected* refund leaves the original (uncompleted) enrollment
+    // record intact. re_enroll() still requires that record to be
+    // `completed`, so it must panic with the completion guard, not the
+    // "no prior enrollment" guard — proving the rejected-refund enrollment
+    // was preserved rather than silently cleared.
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &1_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-REENROLL-REFUND-REJ",
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-REENROLL-REFUND-REJ");
+
+    client.enroll(&student, &course_id);
+    client.request_refund(&student, &course_id);
+    client.process_refund(&admin, &student, &course_id, &false);
+
+    let enrollment = client
+        .get_enrollment(&student, &student, &course_id)
+        .unwrap();
+    assert!(!enrollment.completed);
+    assert!(!enrollment.is_refunded);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.re_enroll(&student, &course_id);
+    }));
+    assert!(
+        result.is_err(),
+        "re_enroll must still fail while the original enrollment is not completed"
+    );
+}
+
 #[test]
 #[should_panic(expected = "no prior enrollment found for this course")]
 fn test_re_enroll_without_prior_enrollment_fails() {
