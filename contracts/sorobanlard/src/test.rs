@@ -314,6 +314,65 @@ fn test_approve_already_active_course() {
     client.approve_course(&admin, &course_id); // second approve — should panic
 }
 
+#[test]
+#[should_panic(expected = "course review period has not elapsed")]
+fn test_approve_course_blocked_before_min_review_delay_elapses() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    // Require a review delay of 100 ledgers between course registration
+    // and approval.
+    client.update_min_review_delay(&admin, &100u32);
+
+    let course_id = String::from_str(&env, "COURSE-REVIEW-DELAY-001");
+    client.register_course(
+        &instructor,
+        &course_id,
+        &50_000_000,
+        &token_id,
+        &0u32,
+        &None,
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &soroban_sdk::Vec::new(&env),
+    );
+
+    // Only 1 ledger has elapsed since registration — far short of the
+    // 100-ledger minimum review delay, so approval must be rejected.
+    env.ledger().with_mut(|l| {
+        l.sequence_number += 1;
+    });
+    client.approve_course(&admin, &course_id);
+}
+
+#[test]
+fn test_approve_course_succeeds_after_min_review_delay_elapses() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    client.update_min_review_delay(&admin, &100u32);
+
+    let course_id = String::from_str(&env, "COURSE-REVIEW-DELAY-002");
+    client.register_course(
+        &instructor,
+        &course_id,
+        &50_000_000,
+        &token_id,
+        &0u32,
+        &None,
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &soroban_sdk::Vec::new(&env),
+    );
+
+    // Advance past the min review delay before approving.
+    env.ledger().with_mut(|l| {
+        l.sequence_number += 101;
+    });
+    client.approve_course(&admin, &course_id);
+
+    let course = client.get_course(&course_id).unwrap();
+    assert_eq!(course.status, CourseStatus::Active);
+}
+
 // ============================================================
 // ENROLLMENT & PAYMENT TESTS
 // ============================================================
