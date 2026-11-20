@@ -13995,3 +13995,344 @@ fn test_current_wasm_hash_none_before_first_upgrade() {
 
     assert_eq!(client.get_current_wasm_hash(), None);
 }
+
+// ============================================================
+// ISSUE #297 — transfer_admin requires both admin signatures
+// ============================================================
+
+#[test]
+#[should_panic(expected = "unauthorized: requires both admin signatures")]
+fn test_transfer_admin_rejects_single_caller_passed_twice() {
+    let (env, contract_id, _token_id, admin, _sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    // Passing the same caller twice must be rejected even though it is a
+    // real admin — both signatures must come from distinct admin1/admin2.
+    let new_admin = Address::generate(&env);
+    let new_sec_admin = Address::generate(&env);
+    client.transfer_admin(&admin, &admin, &new_admin, &new_sec_admin);
+}
+
+#[test]
+#[should_panic(expected = "unauthorized: requires both admin signatures")]
+fn test_transfer_admin_rejects_non_admin_second_caller() {
+    let (env, contract_id, _token_id, admin, _sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    // admin1 is the real admin, but admin2 is an unrelated address instead
+    // of the secondary admin — must be rejected.
+    let random = Address::generate(&env);
+    let new_admin = Address::generate(&env);
+    let new_sec_admin = Address::generate(&env);
+    client.transfer_admin(&admin, &random, &new_admin, &new_sec_admin);
+}
+
+#[test]
+fn test_transfer_admin_succeeds_with_both_signatures_either_order() {
+    let (env, contract_id, _token_id, admin, sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    // admin1 = secondary_admin, admin2 = admin — order must not matter as
+    // long as both real admins are present.
+    let new_admin = Address::generate(&env);
+    let new_sec_admin = Address::generate(&env);
+    client.transfer_admin(&sec_admin, &admin, &new_admin, &new_sec_admin);
+
+    // The proposal was accepted — new admins can now complete the handover.
+    client.accept_admin(&new_admin, &new_sec_admin);
+}
+
+// ============================================================
+// ISSUE #295 — pause_course caller distinction: instructor vs admin
+// ============================================================
+
+#[test]
+fn test_pause_course_by_instructor_succeeds() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let course_id = String::from_str(&env, "COURSE-PAUSE-BY-INSTRUCTOR");
+    register_and_approve_course(
+        &env, &client, &token_id, &admin, &instructor, "COURSE-PAUSE-BY-INSTRUCTOR", 100_000_000,
+    );
+
+    client.pause_course(&instructor, &course_id);
+    let course = client.get_course(&course_id).unwrap();
+    assert_eq!(course.status, CourseStatus::Paused);
+}
+
+#[test]
+fn test_pause_course_by_admin_succeeds() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let course_id = String::from_str(&env, "COURSE-PAUSE-BY-ADMIN");
+    register_and_approve_course(
+        &env, &client, &token_id, &admin, &instructor, "COURSE-PAUSE-BY-ADMIN", 100_000_000,
+    );
+
+    // Admin is neither the instructor nor otherwise related to the course,
+    // but must still be allowed to pause it.
+    client.pause_course(&admin, &course_id);
+    let course = client.get_course(&course_id).unwrap();
+    assert_eq!(course.status, CourseStatus::Paused);
+}
+
+#[test]
+#[should_panic(expected = "unauthorized")]
+fn test_pause_course_by_unrelated_caller_rejected() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let course_id = String::from_str(&env, "COURSE-PAUSE-UNRELATED");
+    register_and_approve_course(
+        &env, &client, &token_id, &admin, &instructor, "COURSE-PAUSE-UNRELATED", 100_000_000,
+    );
+
+    // A random caller who is neither the instructor nor an admin must be rejected.
+    let stranger = Address::generate(&env);
+    client.pause_course(&stranger, &course_id);
+}
+
+// ============================================================
+// ISSUE #296 — unpause_course caller distinction: instructor vs admin
+// ============================================================
+
+#[test]
+fn test_unpause_course_by_instructor_succeeds() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let course_id = String::from_str(&env, "COURSE-UNPAUSE-BY-INSTRUCTOR");
+    register_and_approve_course(
+        &env, &client, &token_id, &admin, &instructor, "COURSE-UNPAUSE-BY-INSTRUCTOR", 100_000_000,
+    );
+
+    client.pause_course(&instructor, &course_id);
+    client.unpause_course(&instructor, &course_id);
+    let course = client.get_course(&course_id).unwrap();
+    assert_eq!(course.status, CourseStatus::Active);
+}
+
+#[test]
+fn test_unpause_course_by_admin_succeeds() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let course_id = String::from_str(&env, "COURSE-UNPAUSE-BY-ADMIN");
+    register_and_approve_course(
+        &env, &client, &token_id, &admin, &instructor, "COURSE-UNPAUSE-BY-ADMIN", 100_000_000,
+    );
+
+    client.pause_course(&instructor, &course_id);
+    client.unpause_course(&admin, &course_id);
+    let course = client.get_course(&course_id).unwrap();
+    assert_eq!(course.status, CourseStatus::Active);
+}
+
+#[test]
+#[should_panic(expected = "unauthorized")]
+fn test_unpause_course_by_unrelated_caller_rejected() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let course_id = String::from_str(&env, "COURSE-UNPAUSE-UNRELATED");
+    register_and_approve_course(
+        &env, &client, &token_id, &admin, &instructor, "COURSE-UNPAUSE-UNRELATED", 100_000_000,
+    );
+
+    client.pause_course(&instructor, &course_id);
+
+    let stranger = Address::generate(&env);
+    client.unpause_course(&stranger, &course_id);
+}
+
+#[test]
+#[should_panic(expected = "instructor is frozen")]
+fn test_unpause_course_by_frozen_instructor_rejected() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let course_id = String::from_str(&env, "COURSE-UNPAUSE-FROZEN");
+    register_and_approve_course(
+        &env, &client, &token_id, &admin, &instructor, "COURSE-UNPAUSE-FROZEN", 100_000_000,
+    );
+
+    // freeze_instructor() auto-pauses the instructor's courses.
+    client.freeze_instructor(&admin, &instructor);
+    let course = client.get_course(&course_id).unwrap();
+    assert_eq!(course.status, CourseStatus::Paused);
+
+    // A frozen instructor must not be able to self-unpause.
+    client.unpause_course(&instructor, &course_id);
+}
+
+#[test]
+fn test_unpause_course_by_admin_overrides_frozen_instructor() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let course_id = String::from_str(&env, "COURSE-UNPAUSE-FROZEN-ADMIN");
+    register_and_approve_course(
+        &env, &client, &token_id, &admin, &instructor, "COURSE-UNPAUSE-FROZEN-ADMIN", 100_000_000,
+    );
+
+    client.freeze_instructor(&admin, &instructor);
+
+    // Admin is exempt from the frozen-instructor restriction.
+    client.unpause_course(&admin, &course_id);
+    let course = client.get_course(&course_id).unwrap();
+    assert_eq!(course.status, CourseStatus::Active);
+}
+
+// ============================================================
+// ISSUE #294 — max_capacity enforcement on enrollment
+// ============================================================
+
+#[test]
+fn test_enroll_unlimited_capacity_allows_many_students() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    // max_capacity = None means unlimited.
+    client.register_course(
+        &instructor,
+        &String::from_str(&env, "COURSE-CAP-UNLIMITED"),
+        &100_000_000,
+        &token_id,
+        &0u32,
+        &None,
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &soroban_sdk::Vec::new(&env),
+    );
+    client.approve_course(&admin, &String::from_str(&env, "COURSE-CAP-UNLIMITED"));
+    env.ledger().with_mut(|l| {
+        l.sequence_number += 1;
+    });
+
+    for _ in 0..5 {
+        let student = Address::generate(&env);
+        token::StellarAssetClient::new(&env, &token_id).mint(&student, &1_000_000_000);
+        client.enroll(&student, &String::from_str(&env, "COURSE-CAP-UNLIMITED"));
+    }
+
+    let course = client
+        .get_course(&String::from_str(&env, "COURSE-CAP-UNLIMITED"))
+        .unwrap();
+    assert_eq!(course.total_enrollments, 5);
+}
+
+#[test]
+fn test_enroll_after_capacity_raised_via_update_course_succeeds() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let course_id = String::from_str(&env, "COURSE-CAP-RAISED");
+    client.register_course(
+        &instructor,
+        &course_id,
+        &100_000_000,
+        &token_id,
+        &0u32,
+        &Some(1u32),
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &soroban_sdk::Vec::new(&env),
+    );
+    client.approve_course(&admin, &course_id);
+    env.ledger().with_mut(|l| {
+        l.sequence_number += 1;
+    });
+
+    let student1 = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student1, &1_000_000_000);
+    client.enroll(&student1, &course_id);
+
+    // Course is now at capacity (1/1) — raise the cap before enrolling a second student.
+    client.update_course(&admin, &course_id, &None, &Some(Some(2u32)));
+
+    let student2 = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student2, &1_000_000_000);
+    client.enroll(&student2, &course_id);
+
+    let course = client.get_course(&course_id).unwrap();
+    assert_eq!(course.total_enrollments, 2);
+}
+
+#[test]
+fn test_enroll_after_clear_max_capacity_succeeds_beyond_old_cap() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let course_id = String::from_str(&env, "COURSE-CAP-CLEARED");
+    client.register_course(
+        &instructor,
+        &course_id,
+        &100_000_000,
+        &token_id,
+        &0u32,
+        &Some(1u32),
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &soroban_sdk::Vec::new(&env),
+    );
+    client.approve_course(&admin, &course_id);
+    env.ledger().with_mut(|l| {
+        l.sequence_number += 1;
+    });
+
+    let student1 = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student1, &1_000_000_000);
+    client.enroll(&student1, &course_id);
+
+    // Lift the cap entirely.
+    client.clear_course_max_capacity(&instructor, &course_id);
+
+    let student2 = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student2, &1_000_000_000);
+    client.enroll(&student2, &course_id);
+
+    let course = client.get_course(&course_id).unwrap();
+    assert_eq!(course.max_capacity, None);
+    assert_eq!(course.total_enrollments, 2);
+}
+
+#[test]
+#[should_panic(expected = "course has reached maximum enrollment capacity")]
+fn test_batch_enroll_rejects_when_one_course_at_capacity() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let full_course_id = String::from_str(&env, "COURSE-CAP-BATCH-FULL");
+    client.register_course(
+        &instructor,
+        &full_course_id,
+        &100_000_000,
+        &token_id,
+        &0u32,
+        &Some(1u32),
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &soroban_sdk::Vec::new(&env),
+    );
+    client.approve_course(&admin, &full_course_id);
+    env.ledger().with_mut(|l| {
+        l.sequence_number += 1;
+    });
+
+    // Fill the course to its capacity of 1 first.
+    let first_student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&first_student, &1_000_000_000);
+    client.enroll(&first_student, &full_course_id);
+
+    let open_course_id = String::from_str(&env, "COURSE-CAP-BATCH-OPEN");
+    register_and_approve_course(
+        &env, &client, &token_id, &admin, &instructor, "COURSE-CAP-BATCH-OPEN", 100_000_000,
+    );
+
+    // Batch-enroll a second student into the open course and the full course —
+    // the whole batch must fail because one course is at capacity.
+    let second_student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&second_student, &1_000_000_000);
+    let mut course_ids = soroban_sdk::Vec::new(&env);
+    course_ids.push_back(open_course_id);
+    course_ids.push_back(full_course_id);
+    client.batch_enroll(&second_student, &course_ids);
+}
