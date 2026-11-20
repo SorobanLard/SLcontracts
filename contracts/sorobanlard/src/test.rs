@@ -14041,3 +14041,56 @@ fn test_transfer_admin_succeeds_with_both_signatures_either_order() {
     // The proposal was accepted — new admins can now complete the handover.
     client.accept_admin(&new_admin, &new_sec_admin);
 }
+
+// ============================================================
+// ISSUE #295 — pause_course caller distinction: instructor vs admin
+// ============================================================
+
+#[test]
+fn test_pause_course_by_instructor_succeeds() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let course_id = String::from_str(&env, "COURSE-PAUSE-BY-INSTRUCTOR");
+    register_and_approve_course(
+        &env, &client, &token_id, &admin, &instructor, "COURSE-PAUSE-BY-INSTRUCTOR", 100_000_000,
+    );
+
+    client.pause_course(&instructor, &course_id);
+    let course = client.get_course(&course_id).unwrap();
+    assert_eq!(course.status, CourseStatus::Paused);
+}
+
+#[test]
+fn test_pause_course_by_admin_succeeds() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let course_id = String::from_str(&env, "COURSE-PAUSE-BY-ADMIN");
+    register_and_approve_course(
+        &env, &client, &token_id, &admin, &instructor, "COURSE-PAUSE-BY-ADMIN", 100_000_000,
+    );
+
+    // Admin is neither the instructor nor otherwise related to the course,
+    // but must still be allowed to pause it.
+    client.pause_course(&admin, &course_id);
+    let course = client.get_course(&course_id).unwrap();
+    assert_eq!(course.status, CourseStatus::Paused);
+}
+
+#[test]
+#[should_panic(expected = "unauthorized")]
+fn test_pause_course_by_unrelated_caller_rejected() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let course_id = String::from_str(&env, "COURSE-PAUSE-UNRELATED");
+    register_and_approve_course(
+        &env, &client, &token_id, &admin, &instructor, "COURSE-PAUSE-UNRELATED", 100_000_000,
+    );
+
+    // A random caller who is neither the instructor nor an admin must be rejected.
+    let stranger = Address::generate(&env);
+    client.pause_course(&stranger, &course_id);
+}
+
