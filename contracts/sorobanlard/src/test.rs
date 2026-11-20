@@ -14184,3 +14184,155 @@ fn test_unpause_course_by_admin_overrides_frozen_instructor() {
     let course = client.get_course(&course_id).unwrap();
     assert_eq!(course.status, CourseStatus::Active);
 }
+
+// ============================================================
+// ISSUE #294 — max_capacity enforcement on enrollment
+// ============================================================
+
+#[test]
+fn test_enroll_unlimited_capacity_allows_many_students() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    // max_capacity = None means unlimited.
+    client.register_course(
+        &instructor,
+        &String::from_str(&env, "COURSE-CAP-UNLIMITED"),
+        &100_000_000,
+        &token_id,
+        &0u32,
+        &None,
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &soroban_sdk::Vec::new(&env),
+    );
+    client.approve_course(&admin, &String::from_str(&env, "COURSE-CAP-UNLIMITED"));
+    env.ledger().with_mut(|l| {
+        l.sequence_number += 1;
+    });
+
+    for _ in 0..5 {
+        let student = Address::generate(&env);
+        token::StellarAssetClient::new(&env, &token_id).mint(&student, &1_000_000_000);
+        client.enroll(&student, &String::from_str(&env, "COURSE-CAP-UNLIMITED"));
+    }
+
+    let course = client
+        .get_course(&String::from_str(&env, "COURSE-CAP-UNLIMITED"))
+        .unwrap();
+    assert_eq!(course.total_enrollments, 5);
+}
+
+#[test]
+fn test_enroll_after_capacity_raised_via_update_course_succeeds() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let course_id = String::from_str(&env, "COURSE-CAP-RAISED");
+    client.register_course(
+        &instructor,
+        &course_id,
+        &100_000_000,
+        &token_id,
+        &0u32,
+        &Some(1u32),
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &soroban_sdk::Vec::new(&env),
+    );
+    client.approve_course(&admin, &course_id);
+    env.ledger().with_mut(|l| {
+        l.sequence_number += 1;
+    });
+
+    let student1 = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student1, &1_000_000_000);
+    client.enroll(&student1, &course_id);
+
+    // Course is now at capacity (1/1) — raise the cap before enrolling a second student.
+    client.update_course(&admin, &course_id, &None, &Some(Some(2u32)));
+
+    let student2 = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student2, &1_000_000_000);
+    client.enroll(&student2, &course_id);
+
+    let course = client.get_course(&course_id).unwrap();
+    assert_eq!(course.total_enrollments, 2);
+}
+
+#[test]
+fn test_enroll_after_clear_max_capacity_succeeds_beyond_old_cap() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let course_id = String::from_str(&env, "COURSE-CAP-CLEARED");
+    client.register_course(
+        &instructor,
+        &course_id,
+        &100_000_000,
+        &token_id,
+        &0u32,
+        &Some(1u32),
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &soroban_sdk::Vec::new(&env),
+    );
+    client.approve_course(&admin, &course_id);
+    env.ledger().with_mut(|l| {
+        l.sequence_number += 1;
+    });
+
+    let student1 = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student1, &1_000_000_000);
+    client.enroll(&student1, &course_id);
+
+    // Lift the cap entirely.
+    client.clear_course_max_capacity(&instructor, &course_id);
+
+    let student2 = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student2, &1_000_000_000);
+    client.enroll(&student2, &course_id);
+
+    let course = client.get_course(&course_id).unwrap();
+    assert_eq!(course.max_capacity, None);
+    assert_eq!(course.total_enrollments, 2);
+}
+
+#[test]
+#[should_panic(expected = "course has reached maximum enrollment capacity")]
+fn test_batch_enroll_rejects_when_one_course_at_capacity() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let full_course_id = String::from_str(&env, "COURSE-CAP-BATCH-FULL");
+    client.register_course(
+        &instructor,
+        &full_course_id,
+        &100_000_000,
+        &token_id,
+        &0u32,
+        &Some(1u32),
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &soroban_sdk::Vec::new(&env),
+    );
+    client.approve_course(&admin, &full_course_id);
+    env.ledger().with_mut(|l| {
+        l.sequence_number += 1;
+    });
+
+    // Fill the course to its capacity of 1 first.
+    let first_student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&first_student, &1_000_000_000);
+    client.enroll(&first_student, &full_course_id);
+
+    let open_course_id = String::from_str(&env, "COURSE-CAP-BATCH-OPEN");
+    register_and_approve_course(
+        &env, &client, &token_id, &admin, &instructor, "COURSE-CAP-BATCH-OPEN", 100_000_000,
+    );
+
+    // Batch-enroll a second student into the open course and the full course —
+    // the whole batch must fail because one course is at capacity.
+    let second_student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&second_student, &1_000_000_000);
+    let mut course_ids = soroban_sdk::Vec::new(&env);
+    course_ids.push_back(open_course_id);
+    course_ids.push_back(full_course_id);
+    client.batch_enroll(&second_student, &course_ids);
+}
