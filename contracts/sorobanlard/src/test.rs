@@ -861,6 +861,36 @@ fn test_enroll_pending_course() {
 }
 
 #[test]
+#[should_panic(expected = "course is not available for enrollment")]
+fn test_enroll_rejected_course() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    let course_id = String::from_str(&env, "COURSE-REJECTED-001");
+    client.register_course(
+        &instructor,
+        &course_id,
+        &500_000_000,
+        &token_id,
+        &0u32,
+        &None,
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &soroban_sdk::Vec::new(&env),
+    );
+
+    client.reject_course(&admin, &course_id, &String::from_str(&env, "low quality"));
+
+    let course = client.get_course(&course_id).unwrap();
+    assert_eq!(course.status, CourseStatus::Rejected);
+
+    // A Rejected course must never accept enrollments.
+    client.enroll(&student, &course_id);
+}
+
+#[test]
 #[should_panic(expected = "cannot enroll in the same ledger the course was registered")]
 fn test_enroll_same_ledger_as_registration_rejected() {
     let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
