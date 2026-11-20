@@ -13997,6 +13997,51 @@ fn test_current_wasm_hash_none_before_first_upgrade() {
 }
 
 // ============================================================
+// ISSUE #314 — propose_upgrade / cancel_upgrade clear pending state
+// ============================================================
+
+#[test]
+#[should_panic(expected = "no pending upgrade")]
+fn test_cancel_upgrade_without_proposal_fails() {
+    let (env, contract_id, _token_id, admin, sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    // Nothing was ever proposed, so there is no pending proposal to clear.
+    client.cancel_upgrade(&admin, &sec_admin);
+}
+
+#[test]
+fn test_cancel_upgrade_fully_clears_state_for_a_fresh_proposal() {
+    let (env, contract_id, _token_id, admin, sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let first_hash = BytesN::from_array(&env, &[9u8; 32]);
+    client.propose_upgrade(&admin, &sec_admin, &first_hash);
+    assert!(client.get_pending_upgrade().is_some());
+
+    client.cancel_upgrade(&admin, &sec_admin);
+    assert!(client.get_pending_upgrade().is_none());
+
+    // A second cancel on the now-empty state must panic the same way a
+    // never-proposed state does — cancel_upgrade leaves no residue behind
+    // that would let it succeed twice.
+    assert!(client.try_cancel_upgrade(&admin, &sec_admin).is_err());
+
+    // After clearing, a brand new proposal (different hash) must be accepted
+    // cleanly and must not carry over any trace of the cancelled one.
+    env.ledger().with_mut(|l| {
+        l.sequence_number += 5;
+    });
+    let second_hash = BytesN::from_array(&env, &[11u8; 32]);
+    client.propose_upgrade(&admin, &sec_admin, &second_hash);
+
+    let pending = client.get_pending_upgrade().unwrap();
+    assert_eq!(pending.new_wasm_hash, second_hash);
+    assert_ne!(pending.new_wasm_hash, first_hash);
+    assert_eq!(pending.proposed_at_ledger, env.ledger().sequence());
+}
+
+// ============================================================
 // ISSUE #313 — freeze_instructor / unfreeze_instructor
 // ============================================================
 
