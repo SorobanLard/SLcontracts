@@ -14241,3 +14241,171 @@ fn test_reproposing_upgrade_resets_timelock() {
         pending.proposed_at_ledger + timelock
     );
 }
+
+// ============================================================
+// ENROLLMENT CIRCUIT BREAKER TESTS (#252)
+// ============================================================
+
+#[test]
+#[should_panic(
+    expected = "course auto-paused after 5 consecutive enrollment failures: circuit breaker tripped"
+)]
+fn test_circuit_breaker_trips_at_threshold() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &1_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-CB-1",
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-CB-1");
+
+    // Simulate CIRCUIT_BREAKER_THRESHOLD prior consecutive failed enrollment
+    // attempts by writing the per-course failure counter directly, matching
+    // how enroll_internal() pre-increments it before each attempted transfer.
+    env.as_contract(&contract_id, || {
+        env.storage().persistent().set(
+            &DataKey::CourseFailureCount(course_id.clone()),
+            &SorobanLardContract::CIRCUIT_BREAKER_THRESHOLD,
+        );
+    });
+
+    // The next enroll() must auto-pause the course and panic before
+    // attempting any token transfer.
+    client.enroll(&student, &course_id);
+}
+
+#[test]
+fn test_circuit_breaker_pauses_course_when_success_crosses_threshold() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &1_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-CB-2",
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-CB-2");
+
+    // CIRCUIT_BREAKER_THRESHOLD - 1 prior failures: the pre-increment inside
+    // this enroll() call pushes the counter to exactly THRESHOLD, which
+    // enroll_internal() treats as crossing the trip point even though this
+    // particular transfer succeeds — the course is auto-paused for future
+    // attempts despite the current call completing.
+    env.as_contract(&contract_id, || {
+        env.storage().persistent().set(
+            &DataKey::CourseFailureCount(course_id.clone()),
+            &(SorobanLardContract::CIRCUIT_BREAKER_THRESHOLD - 1),
+        );
+    });
+
+    client.enroll(&student, &course_id);
+
+    let course = client.get_course(&course_id).unwrap();
+    assert_eq!(
+        course.status,
+        CourseStatus::Paused,
+        "crossing the threshold on a successful call must still auto-pause the course"
+    );
+
+    let failure_count: u32 = env.as_contract(&contract_id, || {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CourseFailureCount(course_id.clone()))
+            .unwrap_or(0)
+    });
+    assert_eq!(
+        failure_count, 0,
+        "the counter is reset on the successful transfer regardless of the pause"
+    );
+}
+
+#[test]
+fn test_circuit_breaker_does_not_trip_below_threshold() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &1_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-CB-3",
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-CB-3");
+
+    // Two failures short of the threshold — the pre-increment inside this
+    // enroll() call lands at THRESHOLD - 1, so enroll() must succeed
+    // normally and the course must remain Active.
+    env.as_contract(&contract_id, || {
+        env.storage().persistent().set(
+            &DataKey::CourseFailureCount(course_id.clone()),
+            &(SorobanLardContract::CIRCUIT_BREAKER_THRESHOLD - 2),
+        );
+    });
+
+    client.enroll(&student, &course_id);
+
+    let course = client.get_course(&course_id).unwrap();
+    assert_eq!(course.status, CourseStatus::Active);
+}
+
+#[test]
+fn test_circuit_breaker_resets_failure_count_on_successful_enrollment() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &1_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-CB-4",
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-CB-4");
+
+    env.as_contract(&contract_id, || {
+        env.storage().persistent().set(
+            &DataKey::CourseFailureCount(course_id.clone()),
+            &(SorobanLardContract::CIRCUIT_BREAKER_THRESHOLD - 2),
+        );
+    });
+
+    client.enroll(&student, &course_id);
+
+    let failure_count: u32 = env.as_contract(&contract_id, || {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CourseFailureCount(course_id.clone()))
+            .unwrap_or(0)
+    });
+    assert_eq!(
+        failure_count, 0,
+        "a successful enroll() must reset the per-course failure counter"
+    );
+}
