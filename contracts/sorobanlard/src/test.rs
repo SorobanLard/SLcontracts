@@ -13995,3 +13995,295 @@ fn test_current_wasm_hash_none_before_first_upgrade() {
 
     assert_eq!(client.get_current_wasm_hash(), None);
 }
+
+// ============================================================
+// ISSUE #314 — propose_upgrade / cancel_upgrade clear pending state
+// ============================================================
+
+#[test]
+#[should_panic(expected = "no pending upgrade")]
+fn test_cancel_upgrade_without_proposal_fails() {
+    let (env, contract_id, _token_id, admin, sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    // Nothing was ever proposed, so there is no pending proposal to clear.
+    client.cancel_upgrade(&admin, &sec_admin);
+}
+
+#[test]
+fn test_cancel_upgrade_fully_clears_state_for_a_fresh_proposal() {
+    let (env, contract_id, _token_id, admin, sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let first_hash = BytesN::from_array(&env, &[9u8; 32]);
+    client.propose_upgrade(&admin, &sec_admin, &first_hash);
+    assert!(client.get_pending_upgrade().is_some());
+
+    client.cancel_upgrade(&admin, &sec_admin);
+    assert!(client.get_pending_upgrade().is_none());
+
+    // A second cancel on the now-empty state must panic the same way a
+    // never-proposed state does — cancel_upgrade leaves no residue behind
+    // that would let it succeed twice.
+    assert!(client.try_cancel_upgrade(&admin, &sec_admin).is_err());
+
+    // After clearing, a brand new proposal (different hash) must be accepted
+    // cleanly and must not carry over any trace of the cancelled one.
+    env.ledger().with_mut(|l| {
+        l.sequence_number += 5;
+    });
+    let second_hash = BytesN::from_array(&env, &[11u8; 32]);
+    client.propose_upgrade(&admin, &sec_admin, &second_hash);
+
+    let pending = client.get_pending_upgrade().unwrap();
+    assert_eq!(pending.new_wasm_hash, second_hash);
+    assert_ne!(pending.new_wasm_hash, first_hash);
+    assert_eq!(pending.proposed_at_ledger, env.ledger().sequence());
+}
+
+// ============================================================
+// ISSUE #313 — freeze_instructor / unfreeze_instructor
+// ============================================================
+
+#[test]
+fn test_freeze_instructor_pauses_active_courses() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "FREEZE-PAUSE-COURSE",
+        100_000_000,
+    );
+
+    let course_before = client
+        .get_course(&String::from_str(&env, "FREEZE-PAUSE-COURSE"))
+        .unwrap();
+    assert_eq!(course_before.status, CourseStatus::Active);
+
+    client.freeze_instructor(&admin, &instructor);
+
+    let course_after = client
+        .get_course(&String::from_str(&env, "FREEZE-PAUSE-COURSE"))
+        .unwrap();
+    assert_eq!(course_after.status, CourseStatus::Paused);
+}
+
+#[test]
+fn test_unfreeze_instructor_does_not_auto_resume_paused_courses() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "UNFREEZE-NO-RESUME-COURSE",
+        100_000_000,
+    );
+
+    client.freeze_instructor(&admin, &instructor);
+    client.unfreeze_instructor(&admin, &instructor);
+    assert!(!client.is_instructor_frozen(&instructor));
+
+    // Unfreezing lifts the registration/enrollment block but must not silently
+    // re-activate courses the freeze paused — that requires an explicit resume.
+    let course = client
+        .get_course(&String::from_str(&env, "UNFREEZE-NO-RESUME-COURSE"))
+        .unwrap();
+    assert_eq!(course.status, CourseStatus::Paused);
+}
+
+#[test]
+fn test_unfreeze_instructor_allows_registering_courses_again() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    client.freeze_instructor(&admin, &instructor);
+    assert!(client
+        .try_register_course(
+            &instructor,
+            &String::from_str(&env, "FROZEN-BLOCKED-COURSE"),
+            &100_000_000i128,
+            &token_id,
+            &0u32,
+            &None,
+            &BytesN::from_array(&env, &[1u8; 32]),
+            &soroban_sdk::Vec::new(&env),
+        )
+        .is_err());
+
+    client.unfreeze_instructor(&admin, &instructor);
+    client.register_course(
+        &instructor,
+        &String::from_str(&env, "UNFROZEN-ALLOWED-COURSE"),
+        &100_000_000i128,
+        &token_id,
+        &0u32,
+        &None,
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &soroban_sdk::Vec::new(&env),
+    );
+    assert!(client
+        .get_course(&String::from_str(&env, "UNFROZEN-ALLOWED-COURSE"))
+        .is_some());
+}
+
+// ============================================================
+// ISSUE #312 — block_student / unblock_student
+// ============================================================
+
+#[test]
+fn test_unblocked_student_can_enroll_after_unblock() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "UNBLOCK-STUDENT-COURSE",
+        100_000_000,
+    );
+
+    client.block_student(&admin, &student);
+    assert!(client
+        .try_enroll(&student, &String::from_str(&env, "UNBLOCK-STUDENT-COURSE"))
+        .is_err());
+
+    // Unblocking must restore the student's ability to enroll.
+    client.unblock_student(&admin, &student);
+    assert!(!client.is_student_blocked(&student));
+    client.enroll(&student, &String::from_str(&env, "UNBLOCK-STUDENT-COURSE"));
+}
+
+#[test]
+fn test_blocking_one_student_does_not_affect_another() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    let blocked_student = Address::generate(&env);
+    let other_student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&other_student, &100_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "SCOPED-BLOCK-COURSE",
+        100_000_000,
+    );
+
+    client.block_student(&admin, &blocked_student);
+    assert!(client.is_student_blocked(&blocked_student));
+    assert!(!client.is_student_blocked(&other_student));
+
+    // The unaffected student must still be able to enroll normally.
+    client.enroll(&other_student, &String::from_str(&env, "SCOPED-BLOCK-COURSE"));
+}
+
+// ============================================================
+// ISSUE #311 — update_max_courses_limit enforces the new cap
+// ============================================================
+
+#[test]
+#[should_panic(expected = "instructor has reached the maximum number of course registrations")]
+fn test_update_max_courses_limit_enforces_lowered_cap() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    // Register 2 courses while the default cap (50) applies.
+    client.register_course(
+        &instructor,
+        &String::from_str(&env, "CAP-COURSE-001"),
+        &1_000_000i128,
+        &token_id,
+        &0u32,
+        &None,
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &soroban_sdk::Vec::new(&env),
+    );
+    client.register_course(
+        &instructor,
+        &String::from_str(&env, "CAP-COURSE-002"),
+        &1_000_000i128,
+        &token_id,
+        &0u32,
+        &None,
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &soroban_sdk::Vec::new(&env),
+    );
+    assert_eq!(client.get_instructor_course_count(&instructor), 2u32);
+
+    // Admin lowers the cap to the instructor's current count — any further
+    // registration must now be rejected even though it was allowed a moment ago.
+    client.update_max_courses_limit(&admin, &2u32);
+    assert_eq!(client.get_max_courses_limit(), 2u32);
+
+    client.register_course(
+        &instructor,
+        &String::from_str(&env, "CAP-COURSE-003"),
+        &1_000_000i128,
+        &token_id,
+        &0u32,
+        &None,
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &soroban_sdk::Vec::new(&env),
+    );
+}
+
+#[test]
+fn test_update_max_courses_limit_raising_cap_allows_more_registrations() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    // Lower the cap to 1 and confirm the second registration is blocked.
+    client.update_max_courses_limit(&admin, &1u32);
+    client.register_course(
+        &instructor,
+        &String::from_str(&env, "CAP-RAISE-001"),
+        &1_000_000i128,
+        &token_id,
+        &0u32,
+        &None,
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &soroban_sdk::Vec::new(&env),
+    );
+    assert!(client
+        .try_register_course(
+            &instructor,
+            &String::from_str(&env, "CAP-RAISE-002"),
+            &1_000_000i128,
+            &token_id,
+            &0u32,
+            &None,
+            &BytesN::from_array(&env, &[1u8; 32]),
+            &soroban_sdk::Vec::new(&env),
+        )
+        .is_err());
+
+    // Raising the cap must immediately permit new registrations again.
+    client.update_max_courses_limit(&admin, &5u32);
+    client.register_course(
+        &instructor,
+        &String::from_str(&env, "CAP-RAISE-002"),
+        &1_000_000i128,
+        &token_id,
+        &0u32,
+        &None,
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &soroban_sdk::Vec::new(&env),
+    );
+    assert_eq!(client.get_instructor_course_count(&instructor), 2u32);
+}
