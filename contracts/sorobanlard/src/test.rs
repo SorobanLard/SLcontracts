@@ -891,6 +891,38 @@ fn test_enroll_rejected_course() {
 }
 
 #[test]
+#[should_panic(expected = "course is not available for enrollment")]
+fn test_enroll_archived_course() {
+    let (env, contract_id, token_id, admin, sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    let course_id = String::from_str(&env, "COURSE-ARCHIVED-001");
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-ARCHIVED-001",
+        500_000_000,
+    );
+
+    // archive_course requires the course to be Paused first, with no
+    // active enrollments remaining.
+    client.pause_course(&admin, &course_id);
+    client.archive_course(&admin, &sec_admin, &course_id, &None);
+
+    let course = client.get_course(&course_id).unwrap();
+    assert_eq!(course.status, CourseStatus::Archived);
+
+    // An Archived course must never accept enrollments.
+    client.enroll(&student, &course_id);
+}
+
+#[test]
 #[should_panic(expected = "cannot enroll in the same ledger the course was registered")]
 fn test_enroll_same_ledger_as_registration_rejected() {
     let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
