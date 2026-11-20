@@ -13995,3 +13995,98 @@ fn test_current_wasm_hash_none_before_first_upgrade() {
 
     assert_eq!(client.get_current_wasm_hash(), None);
 }
+
+// ============================================================
+// ISSUE #311 — update_max_courses_limit enforces the new cap
+// ============================================================
+
+#[test]
+#[should_panic(expected = "instructor has reached the maximum number of course registrations")]
+fn test_update_max_courses_limit_enforces_lowered_cap() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    // Register 2 courses while the default cap (50) applies.
+    client.register_course(
+        &instructor,
+        &String::from_str(&env, "CAP-COURSE-001"),
+        &1_000_000i128,
+        &token_id,
+        &0u32,
+        &None,
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &soroban_sdk::Vec::new(&env),
+    );
+    client.register_course(
+        &instructor,
+        &String::from_str(&env, "CAP-COURSE-002"),
+        &1_000_000i128,
+        &token_id,
+        &0u32,
+        &None,
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &soroban_sdk::Vec::new(&env),
+    );
+    assert_eq!(client.get_instructor_course_count(&instructor), 2u32);
+
+    // Admin lowers the cap to the instructor's current count — any further
+    // registration must now be rejected even though it was allowed a moment ago.
+    client.update_max_courses_limit(&admin, &2u32);
+    assert_eq!(client.get_max_courses_limit(), 2u32);
+
+    client.register_course(
+        &instructor,
+        &String::from_str(&env, "CAP-COURSE-003"),
+        &1_000_000i128,
+        &token_id,
+        &0u32,
+        &None,
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &soroban_sdk::Vec::new(&env),
+    );
+}
+
+#[test]
+fn test_update_max_courses_limit_raising_cap_allows_more_registrations() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    // Lower the cap to 1 and confirm the second registration is blocked.
+    client.update_max_courses_limit(&admin, &1u32);
+    client.register_course(
+        &instructor,
+        &String::from_str(&env, "CAP-RAISE-001"),
+        &1_000_000i128,
+        &token_id,
+        &0u32,
+        &None,
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &soroban_sdk::Vec::new(&env),
+    );
+    assert!(client
+        .try_register_course(
+            &instructor,
+            &String::from_str(&env, "CAP-RAISE-002"),
+            &1_000_000i128,
+            &token_id,
+            &0u32,
+            &None,
+            &BytesN::from_array(&env, &[1u8; 32]),
+            &soroban_sdk::Vec::new(&env),
+        )
+        .is_err());
+
+    // Raising the cap must immediately permit new registrations again.
+    client.update_max_courses_limit(&admin, &5u32);
+    client.register_course(
+        &instructor,
+        &String::from_str(&env, "CAP-RAISE-002"),
+        &1_000_000i128,
+        &token_id,
+        &0u32,
+        &None,
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &soroban_sdk::Vec::new(&env),
+    );
+    assert_eq!(client.get_instructor_course_count(&instructor), 2u32);
+}
