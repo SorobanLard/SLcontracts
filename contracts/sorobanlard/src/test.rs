@@ -15130,3 +15130,305 @@ fn test_mark_completed_evidence_hash_decrements_active_enrollments() {
     let course_after = client.get_course(&course_id).unwrap();
     assert_eq!(course_after.active_enrollments, active_before - 1);
 }
+
+// ============================================================
+// ISSUE_CERTIFICATE WITH EXPIRES_AT_LEDGER TESTS (#303)
+// ============================================================
+
+/// #303 — issue_certificate persists the expires_at_ledger on the certificate.
+#[test]
+fn test_issue_certificate_expires_at_ledger_persisted() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-303-EXPIRY",
+        500_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-303-EXPIRY");
+    client.enroll(&student, &course_id);
+    client.mark_completed(
+        &admin,
+        &student,
+        &course_id,
+        &Some(String::from_str(&env, "evidence-303-expiry")),
+    );
+
+    let expiry_ledger: u32 = env.ledger().sequence() + 10_000;
+    let cert_id = String::from_str(&env, "CERT-303-EXPIRY");
+    client.issue_certificate(
+        &admin,
+        &student,
+        &course_id,
+        &cert_id,
+        &String::from_str(&env, "Course 303 Expiry"),
+        &get_enrollment_ref(&env, &client, &student, "COURSE-303-EXPIRY"),
+        &Some(expiry_ledger),
+        &None,
+    );
+
+    let cert = client.get_certificate(&student, &cert_id);
+    assert_eq!(cert.expires_at_ledger, Some(expiry_ledger));
+}
+
+/// #303 — A certificate with expires_at_ledger in the future is still valid.
+#[test]
+fn test_issue_certificate_expires_in_future_is_valid() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-303-FUTURE",
+        500_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-303-FUTURE");
+    client.enroll(&student, &course_id);
+    client.mark_completed(
+        &admin,
+        &student,
+        &course_id,
+        &Some(String::from_str(&env, "evidence-303-future")),
+    );
+
+    let expiry_ledger: u32 = env.ledger().sequence() + 50_000;
+    let cert_id = String::from_str(&env, "CERT-303-FUTURE");
+    client.issue_certificate(
+        &admin,
+        &student,
+        &course_id,
+        &cert_id,
+        &String::from_str(&env, "Course 303 Future"),
+        &get_enrollment_ref(&env, &client, &student, "COURSE-303-FUTURE"),
+        &Some(expiry_ledger),
+        &None,
+    );
+
+    // Certificate has not yet reached its expiry — verify_certificate returns true.
+    assert!(client.verify_certificate(&cert_id));
+}
+
+/// #303 — A certificate with expires_at_ledger in the past is no longer valid.
+#[test]
+fn test_issue_certificate_expires_at_past_ledger_is_invalid() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-303-PAST",
+        500_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-303-PAST");
+    client.enroll(&student, &course_id);
+    client.mark_completed(
+        &admin,
+        &student,
+        &course_id,
+        &Some(String::from_str(&env, "evidence-303-past")),
+    );
+
+    let expiry_ledger: u32 = env.ledger().sequence() + 100;
+    let cert_id = String::from_str(&env, "CERT-303-PAST");
+    client.issue_certificate(
+        &admin,
+        &student,
+        &course_id,
+        &cert_id,
+        &String::from_str(&env, "Course 303 Past"),
+        &get_enrollment_ref(&env, &client, &student, "COURSE-303-PAST"),
+        &Some(expiry_ledger),
+        &None,
+    );
+
+    // Advance the ledger past the expiry.
+    env.ledger().with_mut(|l| {
+        l.sequence_number = expiry_ledger;
+    });
+
+    // Certificate has expired — verify_certificate must return false.
+    assert!(!client.verify_certificate(&cert_id));
+}
+
+/// #303 — Validity flips from true to false exactly at the expiry ledger boundary.
+#[test]
+fn test_issue_certificate_expires_at_exact_boundary() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-303-BOUNDARY",
+        500_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-303-BOUNDARY");
+    client.enroll(&student, &course_id);
+    client.mark_completed(
+        &admin,
+        &student,
+        &course_id,
+        &Some(String::from_str(&env, "evidence-303-boundary")),
+    );
+
+    let expiry_ledger: u32 = env.ledger().sequence() + 500;
+    let cert_id = String::from_str(&env, "CERT-303-BOUNDARY");
+    client.issue_certificate(
+        &admin,
+        &student,
+        &course_id,
+        &cert_id,
+        &String::from_str(&env, "Course 303 Boundary"),
+        &get_enrollment_ref(&env, &client, &student, "COURSE-303-BOUNDARY"),
+        &Some(expiry_ledger),
+        &None,
+    );
+
+    // One ledger before expiry: certificate is still valid.
+    env.ledger().with_mut(|l| {
+        l.sequence_number = expiry_ledger - 1;
+    });
+    assert!(client.verify_certificate(&cert_id));
+
+    // At the exact expiry ledger: certificate is expired.
+    env.ledger().with_mut(|l| {
+        l.sequence_number = expiry_ledger;
+    });
+    assert!(!client.verify_certificate(&cert_id));
+}
+
+/// #303 — A certificate with no expires_at_ledger (None) never expires.
+#[test]
+fn test_issue_certificate_without_expires_at_ledger_never_expires() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-303-NO-EXPIRY",
+        500_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-303-NO-EXPIRY");
+    client.enroll(&student, &course_id);
+    client.mark_completed(
+        &admin,
+        &student,
+        &course_id,
+        &Some(String::from_str(&env, "evidence-303-no-expiry")),
+    );
+
+    let cert_id = String::from_str(&env, "CERT-303-NO-EXPIRY");
+    client.issue_certificate(
+        &admin,
+        &student,
+        &course_id,
+        &cert_id,
+        &String::from_str(&env, "Course 303 No Expiry"),
+        &get_enrollment_ref(&env, &client, &student, "COURSE-303-NO-EXPIRY"),
+        &None,
+        &None,
+    );
+
+    let cert = client.get_certificate(&student, &cert_id);
+    assert_eq!(cert.expires_at_ledger, None);
+
+    // Advance far into the future — no expiry means still valid.
+    env.ledger().with_mut(|l| {
+        l.sequence_number += 1_000_000;
+    });
+    assert!(client.verify_certificate(&cert_id));
+}
+
+/// #303 — Expired certificates retain all original fields (student, course_id,
+/// issued_at_ledger) so auditors can still inspect them.
+#[test]
+fn test_issue_certificate_expired_retains_full_audit_data() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-303-AUDIT",
+        500_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-303-AUDIT");
+    client.enroll(&student, &course_id);
+    client.mark_completed(
+        &admin,
+        &student,
+        &course_id,
+        &Some(String::from_str(&env, "evidence-303-audit")),
+    );
+
+    let issued_at = env.ledger().sequence();
+    let expiry_ledger: u32 = issued_at + 200;
+    let cert_id = String::from_str(&env, "CERT-303-AUDIT");
+    client.issue_certificate(
+        &admin,
+        &student,
+        &course_id,
+        &cert_id,
+        &String::from_str(&env, "Course 303 Audit"),
+        &get_enrollment_ref(&env, &client, &student, "COURSE-303-AUDIT"),
+        &Some(expiry_ledger),
+        &None,
+    );
+
+    // Advance past expiry.
+    env.ledger().with_mut(|l| {
+        l.sequence_number = expiry_ledger;
+    });
+
+    // The certificate record is still retrievable and contains original data.
+    let cert = client.get_certificate(&student, &cert_id);
+    assert_eq!(cert.student, student);
+    assert_eq!(cert.course_id, course_id);
+    assert_eq!(cert.expires_at_ledger, Some(expiry_ledger));
+    assert!(cert.issued_at_ledger <= issued_at + 1);
+    assert!(!cert.revoked);
+
+    // But verify returns false because it has expired.
+    assert!(!client.verify_certificate(&cert_id));
+}
