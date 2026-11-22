@@ -4127,6 +4127,87 @@ fn test_archive_moves_record_and_get_course_returns_archive_during_cooldown() {
 }
 
 // ============================================================
+// ISSUE 317: get_course() RETURNS THE ARCHIVED RECORD VIA ArchivedCourse
+// ============================================================
+
+/// #317 — after `archive_course()`, the active `Course` key is removed and the
+/// record lives only under `DataKey::ArchivedCourse`. `get_course()` must
+/// return that archived record (never `None`, never a stale active copy) by
+/// reading it directly from the `ArchivedCourse` storage key.
+#[test]
+fn test_get_course_returns_archived_record_via_archived_key() {
+    use soroban_sdk::xdr::ToXdr;
+
+    let (env, contract_id, token_id, admin, sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let course_id = String::from_str(&env, "COURSE-ARCH-317");
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-ARCH-317",
+        250_000_000,
+    );
+
+    // Archiving requires the course to be paused first.
+    client.pause_course(&admin, &course_id);
+    client.archive_course(&admin, &sec_admin, &course_id, &None);
+
+    // The active key is gone; the record now lives only under ArchivedCourse.
+    let (active_present, archived_present) = env.as_contract(&contract_id, || {
+        (
+            env.storage()
+                .persistent()
+                .has(&DataKey::Course(course_id.clone())),
+            env.storage()
+                .persistent()
+                .has(&DataKey::ArchivedCourse(course_id.clone())),
+        )
+    });
+    assert!(
+        !active_present,
+        "active Course key must be removed on archive"
+    );
+    assert!(
+        archived_present,
+        "ArchivedCourse key must hold the record after archive"
+    );
+
+    // `get_course()` must return the exact record stored under ArchivedCourse.
+    let returned = client
+        .get_course(&course_id)
+        .expect("get_course must return the archived record");
+
+    // Sanity-check the distinguishing fields of an archived record. These
+    // borrow `returned` and must run before the byte-for-byte comparison,
+    // whose `to_xdr(self, ..)` consumes it.
+    assert_eq!(returned.id, course_id);
+    assert_eq!(returned.instructor, instructor);
+    assert_eq!(returned.price, 250_000_000);
+    assert_eq!(returned.status, CourseStatus::Archived);
+    assert!(returned.archived_at_ledger.is_some());
+
+    // The returned record must match the ArchivedCourse storage entry
+    // byte-for-byte, proving get_course read it from the archived key rather
+    // than a stale active copy.
+    let archived_xdr = env.as_contract(&contract_id, || {
+        env.storage()
+            .persistent()
+            .get::<DataKey, Course>(&DataKey::ArchivedCourse(course_id.clone()))
+            .unwrap()
+            .to_xdr(&env)
+    });
+    assert_eq!(
+        returned.to_xdr(&env),
+        archived_xdr,
+        "get_course must return the ArchivedCourse record byte-for-byte"
+    );
+}
+
+// ============================================================
 // ISSUE 48: CONCURRENT ENROLLMENT/COMPLETION
 // ============================================================
 
