@@ -14641,3 +14641,295 @@ fn test_course_certificates_index_grows_per_issuance() {
     assert_eq!(final_index.len(), 3);
     assert_eq!(final_index.get(2).unwrap(), String::from_str(&env, "CERT-IDX-320-C"));
 }
+
+// ============================================================
+// EVENT EMISSION: course_completed (#334)
+// ============================================================
+
+#[test]
+fn test_mark_completed_emits_course_completed_with_course_id_and_student() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-EVT-COMPLETED",
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-EVT-COMPLETED");
+
+    client.enroll(&student, &course_id);
+    client.mark_completed(
+        &admin,
+        &student,
+        &course_id,
+        &Some(String::from_str(&env, "evidence")),
+    );
+
+    let mut completed_events = 0u32;
+    for (contract, topics, data) in env.events().all().iter() {
+        if contract != contract_id {
+            continue;
+        }
+        let sym: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        if sym != Symbol::new(&env, "course_completed") {
+            continue;
+        }
+        completed_events += 1;
+
+        let event_course_id: String = topics.get(1).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(event_course_id, course_id);
+
+        let (event_student, event_admin, event_ledger): (Address, Address, u32) =
+            data.try_into_val(&env).unwrap();
+        assert_eq!(event_student, student);
+        assert_eq!(event_admin, admin);
+        assert_eq!(event_ledger, env.ledger().sequence());
+    }
+    assert_eq!(completed_events, 1);
+}
+
+#[test]
+fn test_mark_completed_panic_for_non_enrolled_student_emits_no_course_completed() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-EVT-NOT-ENROLLED",
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-EVT-NOT-ENROLLED");
+    let non_enrolled = Address::generate(&env);
+
+    let result = client.try_mark_completed(
+        &admin,
+        &non_enrolled,
+        &course_id,
+        &Some(String::from_str(&env, "evidence")),
+    );
+    assert!(result.is_err());
+    assert!(!has_event(&env, &contract_id, "course_completed"));
+}
+
+// ============================================================
+// EVENT EMISSION: course_certificates_revoked (#335)
+// ============================================================
+
+#[test]
+fn test_bulk_revoke_event_revoked_count_matches_newly_revoked() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-EVT-BULK-COUNT",
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-EVT-BULK-COUNT");
+    for cert_name in [
+        "CERT-EVT-BULK-COUNT-0",
+        "CERT-EVT-BULK-COUNT-1",
+        "CERT-EVT-BULK-COUNT-2",
+    ] {
+        let student = Address::generate(&env);
+        enroll_and_certify(
+            &env,
+            &client,
+            &token_id,
+            &admin,
+            &student,
+            "COURSE-EVT-BULK-COUNT",
+            cert_name,
+        );
+    }
+
+    // One certificate is already revoked, so only two are newly revoked.
+    client.revoke_certificate(
+        &admin,
+        &String::from_str(&env, "CERT-EVT-BULK-COUNT-0"),
+        &String::from_str(&env, "ISSUED_IN_ERROR"),
+    );
+
+    let revoked_count = client.bulk_revoke_course_certificates(&admin, &course_id);
+    assert_eq!(revoked_count, 2);
+
+    let (_event_admin, event_course_id, event_count, _event_ledger): (
+        Address,
+        String,
+        u32,
+        u32,
+    ) = last_event_val(&env, &contract_id, "course_certificates_revoked")
+        .try_into_val(&env)
+        .unwrap();
+    assert_eq!(event_course_id, course_id);
+    assert_eq!(event_count, revoked_count);
+}
+
+#[test]
+fn test_bulk_revoke_event_ledger_matches_current_sequence() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-EVT-BULK-LEDGER",
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-EVT-BULK-LEDGER");
+    let student = Address::generate(&env);
+    enroll_and_certify(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &student,
+        "COURSE-EVT-BULK-LEDGER",
+        "CERT-EVT-BULK-LEDGER",
+    );
+
+    let revoke_ledger = env.ledger().sequence() + 250;
+    env.ledger().with_mut(|l| {
+        l.sequence_number = revoke_ledger;
+    });
+
+    client.bulk_revoke_course_certificates(&admin, &course_id);
+
+    let (_event_admin, _event_course_id, _event_count, event_ledger): (
+        Address,
+        String,
+        u32,
+        u32,
+    ) = last_event_val(&env, &contract_id, "course_certificates_revoked")
+        .try_into_val(&env)
+        .unwrap();
+    assert_eq!(event_ledger, revoke_ledger);
+    assert_eq!(event_ledger, env.ledger().sequence());
+}
+
+#[test]
+fn test_bulk_revoke_event_admin_matches_calling_admin() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-EVT-BULK-ADMIN",
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-EVT-BULK-ADMIN");
+    let student = Address::generate(&env);
+    enroll_and_certify(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &student,
+        "COURSE-EVT-BULK-ADMIN",
+        "CERT-EVT-BULK-ADMIN",
+    );
+
+    client.bulk_revoke_course_certificates(&admin, &course_id);
+
+    let (event_admin, _event_course_id, _event_count, _event_ledger): (
+        Address,
+        String,
+        u32,
+        u32,
+    ) = last_event_val(&env, &contract_id, "course_certificates_revoked")
+        .try_into_val(&env)
+        .unwrap();
+    assert_eq!(event_admin, admin);
+    assert_ne!(event_admin, student);
+    assert_ne!(event_admin, instructor);
+}
+
+// ============================================================
+// EVENT EMISSION: course_approved (#336)
+// ============================================================
+
+#[test]
+fn test_approve_course_emits_course_approved_with_course_id() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let course_id = String::from_str(&env, "COURSE-EVT-APPROVED");
+    client.register_course(
+        &instructor,
+        &course_id,
+        &100_000_000,
+        &token_id,
+        &0u32,
+        &None,
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &soroban_sdk::Vec::new(&env),
+    );
+    client.approve_course(&admin, &course_id);
+
+    let mut approved_events = 0u32;
+    for (contract, topics, data) in env.events().all().iter() {
+        if contract != contract_id {
+            continue;
+        }
+        let sym: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        if sym != Symbol::new(&env, "course_approved") {
+            continue;
+        }
+        approved_events += 1;
+
+        let topic_course_id: String = topics.get(1).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(topic_course_id, course_id);
+
+        let (event_course_id, _instructor, _admin, _ledger): (String, Address, Address, u32) =
+            data.try_into_val(&env).unwrap();
+        assert_eq!(event_course_id, course_id);
+    }
+    assert_eq!(approved_events, 1);
+}
+
+#[test]
+fn test_approve_course_panic_for_non_pending_course_emits_no_course_approved() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let course_id = String::from_str(&env, "COURSE-EVT-NOT-PENDING");
+    client.register_course(
+        &instructor,
+        &course_id,
+        &100_000_000,
+        &token_id,
+        &0u32,
+        &None,
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &soroban_sdk::Vec::new(&env),
+    );
+    client.reject_course(&admin, &course_id, &String::from_str(&env, "low quality"));
+    assert_eq!(client.get_course(&course_id).unwrap().status, CourseStatus::Rejected);
+
+    let result = client.try_approve_course(&admin, &course_id);
+    assert!(result.is_err());
+    assert!(!has_event(&env, &contract_id, "course_approved"));
+}
