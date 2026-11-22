@@ -14641,3 +14641,243 @@ fn test_course_certificates_index_grows_per_issuance() {
     assert_eq!(final_index.len(), 3);
     assert_eq!(final_index.get(2).unwrap(), String::from_str(&env, "CERT-IDX-320-C"));
 }
+
+// ============================================================
+// ISSUE #319 — EnrollmentHistory appending on each re-enroll
+// ============================================================
+
+/// Each call to re_enroll() must push exactly one Enrollment record into
+/// the history list. After N re-enrollments, the history must contain N
+/// entries, each with the full data from the archived attempt.
+#[test]
+fn test_enrollment_history_appends_one_entry_per_re_enroll() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &10_000_000_000);
+
+    let price: i128 = 300_000_000;
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-HIST-319-A",
+        price,
+    );
+    let course_id = String::from_str(&env, "COURSE-HIST-319-A");
+
+    // Before any re-enroll the history is empty.
+    assert_eq!(
+        client
+            .get_enrollment_history(&student, &student, &course_id)
+            .len(),
+        0
+    );
+
+    // First cycle: enroll → complete → re-enroll (archives attempt 1).
+    client.enroll(&student, &course_id);
+    let enrolled_at_1 = env.ledger().sequence();
+    client.mark_completed(
+        &admin,
+        &student,
+        &course_id,
+        &Some(String::from_str(&env, "evidence-319-1")),
+    );
+    client.re_enroll(&student, &course_id);
+
+    let history_after_1 = client.get_enrollment_history(&student, &student, &course_id);
+    assert_eq!(
+        history_after_1.len(),
+        1,
+        "history must have exactly 1 entry after first re-enroll"
+    );
+
+    // The archived record must carry the data from the first attempt.
+    let archived_1 = history_after_1.get(0).unwrap();
+    assert_eq!(archived_1.course_id, course_id);
+    assert_eq!(archived_1.amount_paid, price);
+    assert!(archived_1.completed, "archived record must be marked completed");
+    assert_eq!(
+        archived_1.evidence_hash,
+        Some(String::from_str(&env, "evidence-319-1"))
+    );
+    assert_eq!(archived_1.enrolled_at_ledger, enrolled_at_1);
+    assert!(!archived_1.is_refunded);
+
+    // Second cycle: complete the new enrollment → re-enroll (archives attempt 2).
+    client.mark_completed(
+        &admin,
+        &student,
+        &course_id,
+        &Some(String::from_str(&env, "evidence-319-2")),
+    );
+    client.re_enroll(&student, &course_id);
+
+    let history_after_2 = client.get_enrollment_history(&student, &student, &course_id);
+    assert_eq!(
+        history_after_2.len(),
+        2,
+        "history must have exactly 2 entries after second re-enroll"
+    );
+
+    // The second archived record must be distinct from the first.
+    let archived_2 = history_after_2.get(1).unwrap();
+    assert_eq!(archived_2.course_id, course_id);
+    assert_eq!(archived_2.amount_paid, price);
+    assert!(archived_2.completed);
+    assert_eq!(
+        archived_2.evidence_hash,
+        Some(String::from_str(&env, "evidence-319-2"))
+    );
+    // The second attempt's enrolled_at_ledger must be at or after the first.
+    assert!(
+        archived_2.enrolled_at_ledger >= archived_1.enrolled_at_ledger,
+        "each attempt is enrolled at a non-decreasing ledger"
+    );
+
+    // Third cycle: archives attempt 3.
+    client.mark_completed(
+        &admin,
+        &student,
+        &course_id,
+        &Some(String::from_str(&env, "evidence-319-3")),
+    );
+    client.re_enroll(&student, &course_id);
+
+    assert_eq!(
+        client
+            .get_enrollment_history(&student, &student, &course_id)
+            .len(),
+        3,
+        "history must have exactly 3 entries after third re-enroll"
+    );
+}
+
+/// re_enroll() archives the full Enrollment record, including the
+/// certificate_id link, so the history is an auditable chain of
+/// prior completions and certificates.
+#[test]
+fn test_enrollment_history_preserves_certificate_link_on_re_enroll() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &10_000_000_000);
+
+    let price: i128 = 400_000_000;
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-HIST-319-B",
+        price,
+    );
+    let course_id = String::from_str(&env, "COURSE-HIST-319-B");
+    let cert_id = String::from_str(&env, "CERT-HIST-319-B");
+
+    client.enroll(&student, &course_id);
+    client.mark_completed(
+        &admin,
+        &student,
+        &course_id,
+        &Some(String::from_str(&env, "evidence-cert")),
+    );
+    client.issue_certificate(
+        &admin,
+        &student,
+        &course_id,
+        &cert_id,
+        &String::from_str(&env, "History Course"),
+        &get_enrollment_ref(&env, &client, &student, "COURSE-HIST-319-B"),
+        &None,
+        &None,
+    );
+
+    // re_enroll archives the completed enrollment including its certificate link.
+    client.re_enroll(&student, &course_id);
+
+    let history = client.get_enrollment_history(&student, &student, &course_id);
+    assert_eq!(history.len(), 1);
+
+    let archived = history.get(0).unwrap();
+    assert!(
+        archived.certificate_issued,
+        "archived record must reflect that the certificate was issued"
+    );
+    assert_eq!(
+        archived.certificate_id,
+        Some(cert_id),
+        "archived record must carry the certificate_id"
+    );
+
+    // The live enrollment starts fresh: no certificate yet.
+    let live = client
+        .get_enrollment(&student, &student, &course_id)
+        .unwrap();
+    assert!(!live.certificate_issued);
+    assert!(live.certificate_id.is_none());
+}
+
+/// History entries are appended in re-enroll order: oldest attempt is at
+/// index 0, most recent at index len-1.
+#[test]
+fn test_enrollment_history_order_is_oldest_first() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &10_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-HIST-319-C",
+        200_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-HIST-319-C");
+
+    // Attempt 1
+    client.enroll(&student, &course_id);
+    let ledger_1 = env.ledger().sequence();
+    client.mark_completed(
+        &admin,
+        &student,
+        &course_id,
+        &Some(String::from_str(&env, "ev-1")),
+    );
+    env.ledger().with_mut(|l| l.sequence_number += 5);
+    client.re_enroll(&student, &course_id);
+
+    // Attempt 2
+    let ledger_2 = env.ledger().sequence();
+    client.mark_completed(
+        &admin,
+        &student,
+        &course_id,
+        &Some(String::from_str(&env, "ev-2")),
+    );
+    env.ledger().with_mut(|l| l.sequence_number += 5);
+    client.re_enroll(&student, &course_id);
+
+    let history = client.get_enrollment_history(&student, &student, &course_id);
+    assert_eq!(history.len(), 2);
+
+    // Index 0 must be the earliest attempt.
+    assert_eq!(history.get(0).unwrap().enrolled_at_ledger, ledger_1);
+    // Index 1 must be the later attempt.
+    assert_eq!(history.get(1).unwrap().enrolled_at_ledger, ledger_2);
+    // Strictly ordered.
+    assert!(
+        history.get(0).unwrap().enrolled_at_ledger
+            <= history.get(1).unwrap().enrolled_at_ledger,
+        "history entries must be in non-decreasing ledger order"
+    );
+}
