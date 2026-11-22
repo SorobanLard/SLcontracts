@@ -14881,3 +14881,171 @@ fn test_enrollment_history_order_is_oldest_first() {
         "history entries must be in non-decreasing ledger order"
     );
 }
+
+// ============================================================
+// ISSUE #411 — reject_course event emission
+// ============================================================
+
+/// reject_course() must emit exactly one `course_rejected` event with
+/// the correct topic layout and payload data.
+#[test]
+fn test_reject_course_emits_course_rejected_event() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let course_id = String::from_str(&env, "COURSE-EVENT-REJECT-411");
+    client.register_course(
+        &instructor,
+        &course_id,
+        &100_000_000,
+        &token_id,
+        &0u32,
+        &None,
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &soroban_sdk::Vec::new(&env),
+    );
+
+    let reason = String::from_str(&env, "CONTENT_POLICY_VIOLATION");
+    let ledger_before = env.ledger().sequence();
+    client.reject_course(&admin, &course_id, &reason);
+
+    let events = env.events().all();
+    let mut reject_events = 0u32;
+
+    for (contract, topics, data) in events.iter() {
+        if contract != contract_id {
+            continue;
+        }
+
+        let topic0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        if topic0 != Symbol::new(&env, "course_rejected") {
+            continue;
+        }
+
+        reject_events += 1;
+
+        // Topic 1 must be the course_id.
+        let topic1: String = topics.get(1).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(topic1, course_id);
+
+        // Payload: (course_id, instructor, caller/admin, reason, ledger_sequence)
+        let (ev_course_id, ev_instructor, ev_caller, ev_reason, ev_ledger): (
+            String,
+            Address,
+            Address,
+            String,
+            u32,
+        ) = data.try_into_val(&env).unwrap();
+
+        assert_eq!(ev_course_id, course_id);
+        assert_eq!(ev_instructor, instructor);
+        assert_eq!(ev_caller, admin);
+        assert_eq!(ev_reason, reason);
+        assert!(
+            ev_ledger >= ledger_before,
+            "event ledger must be >= ledger before call"
+        );
+    }
+
+    assert_eq!(
+        reject_events, 1,
+        "exactly one course_rejected event must be emitted"
+    );
+}
+
+/// When reject_course() is called by an approver (not the admin), the
+/// event must still carry the approver as `caller`.
+#[test]
+fn test_reject_course_event_records_approver_as_caller() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    // Register an approver and add them to the approved list.
+    let approver = Address::generate(&env);
+    client.add_approver(&admin, &approver);
+
+    let course_id = String::from_str(&env, "COURSE-EVENT-REJECT-411B");
+    client.register_course(
+        &instructor,
+        &course_id,
+        &100_000_000,
+        &token_id,
+        &0u32,
+        &None,
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &soroban_sdk::Vec::new(&env),
+    );
+
+    let reason = String::from_str(&env, "POOR_CONTENT_QUALITY");
+    client.reject_course(&approver, &course_id, &reason);
+
+    let events = env.events().all();
+    let mut found = false;
+    for (contract, topics, data) in events.iter() {
+        if contract != contract_id {
+            continue;
+        }
+        let topic0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        if topic0 != Symbol::new(&env, "course_rejected") {
+            continue;
+        }
+        found = true;
+        let (_, _, ev_caller, _, _): (String, Address, Address, String, u32) =
+            data.try_into_val(&env).unwrap();
+        assert_eq!(
+            ev_caller, approver,
+            "event caller must be the approver, not the admin"
+        );
+    }
+    assert!(
+        found,
+        "course_rejected event must be emitted when approver rejects a course"
+    );
+}
+
+/// reject_course() must NOT emit a course_rejected event when the call
+/// panics (e.g. the course is not in Pending status). This confirms that
+/// only courses in Pending state produce the rejection event.
+#[test]
+fn test_reject_course_no_event_on_already_active_course() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let course_id = String::from_str(&env, "COURSE-NO-EVENT-REJECT-411C");
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-NO-EVENT-REJECT-411C",
+        100_000_000,
+    );
+
+    // Trying to reject an Active course must panic and produce no event.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.reject_course(
+            &admin,
+            &course_id,
+            &String::from_str(&env, "reason"),
+        );
+    }));
+    assert!(result.is_err(), "rejecting an Active course must panic");
+
+    let reject_events = env
+        .events()
+        .all()
+        .iter()
+        .filter(|(contract, topics, _)| {
+            if contract != &contract_id {
+                return false;
+            }
+            let topic0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+            topic0 == Symbol::new(&env, "course_rejected")
+        })
+        .count();
+    assert_eq!(
+        reject_events, 0,
+        "no course_rejected event should be emitted when rejection panics"
+    );
+}
