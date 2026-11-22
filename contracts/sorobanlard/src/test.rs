@@ -14531,6 +14531,45 @@ fn test_storage_schema_version_defaults_to_current() {
     );
 }
 
+/// #315 — before any `migrate()` call, `get_storage_schema_version()` must
+/// return the *initial* schema version. `init()` never writes the
+/// `StorageSchemaVersion` key, so the getter falls back to
+/// `STORAGE_SCHEMA_VERSION_INITIAL`; a freshly initialised contract therefore
+/// reports the initial version rather than a stored one.
+#[test]
+fn test_get_storage_schema_version_returns_initial_value_before_migration() {
+    let (env, contract_id, _token_id, _admin, _sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    // The version key is never written by init(); its absence is what makes
+    // the getter report the initial value via `unwrap_or`.
+    let version_key_present = env.as_contract(&contract_id, || {
+        env.storage()
+            .instance()
+            .has(&DataKey2::StorageSchemaVersion)
+    });
+    assert!(
+        !version_key_present,
+        "init() must not write the schema-version key before a migration"
+    );
+
+    // The getter therefore returns the initial version, not a stored one.
+    assert_eq!(
+        client.get_storage_schema_version(),
+        SorobanLardContract::STORAGE_SCHEMA_VERSION_INITIAL,
+        "a fresh deployment must report the initial schema version"
+    );
+
+    // Today the initial and deployed versions coincide, so the existing
+    // "defaults to current" assertion still holds; this test pins the
+    // *initial* value so a future bump (INITIAL < CURRENT) keeps the default
+    // readable and distinguishable from an upgraded deployment.
+    assert_eq!(
+        SorobanLardContract::STORAGE_SCHEMA_VERSION_INITIAL,
+        SorobanLardContract::STORAGE_SCHEMA_VERSION,
+    );
+}
+
 #[test]
 #[should_panic(expected = "storage already at current schema version")]
 fn test_migrate_rejected_when_already_current() {
