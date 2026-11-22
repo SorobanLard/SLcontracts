@@ -15432,3 +15432,203 @@ fn test_issue_certificate_expired_retains_full_audit_data() {
     // But verify returns false because it has expired.
     assert!(!client.verify_certificate(&cert_id));
 }
+
+// ============================================================
+// BULK_REVOKE_COURSE_CERTIFICATES WITH ZERO CERTIFICATES TESTS (#304)
+// ============================================================
+
+/// #304 — bulk_revoke_course_certificates panics with the expected message
+/// when a course has never had any certificate issued.
+#[test]
+#[should_panic(expected = "no certificates issued for this course")]
+fn test_bulk_revoke_zero_certs_active_course_panics() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-304-ACTIVE-EMPTY",
+        100_000_000,
+    );
+
+    // The course is Active but no certificates have been issued.
+    client.bulk_revoke_course_certificates(
+        &admin,
+        &String::from_str(&env, "COURSE-304-ACTIVE-EMPTY"),
+    );
+}
+
+/// #304 — bulk_revoke_course_certificates panics for a Paused course that
+/// has no certificates.
+#[test]
+#[should_panic(expected = "no certificates issued for this course")]
+fn test_bulk_revoke_zero_certs_paused_course_panics() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-304-PAUSED-EMPTY",
+        100_000_000,
+    );
+    // Pause the course so it is in a non-Active state.
+    client.pause_course(&admin, &String::from_str(&env, "COURSE-304-PAUSED-EMPTY"));
+
+    client.bulk_revoke_course_certificates(
+        &admin,
+        &String::from_str(&env, "COURSE-304-PAUSED-EMPTY"),
+    );
+}
+
+/// #304 — get_course_certificates returns an empty list for a newly registered
+/// course before any certificates have been issued.
+#[test]
+fn test_bulk_revoke_zero_certs_index_is_empty_before_issuance() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-304-INDEX-EMPTY",
+        100_000_000,
+    );
+
+    let course_id = String::from_str(&env, "COURSE-304-INDEX-EMPTY");
+    // The certificate index must be empty before any issuance.
+    assert_eq!(client.get_course_certificates(&course_id).len(), 0);
+}
+
+/// #304 — bulk_revoke_course_certificates panics with the expected message
+/// for a course that has enrollments but zero completed/certified students.
+#[test]
+#[should_panic(expected = "no certificates issued for this course")]
+fn test_bulk_revoke_zero_certs_enrolled_but_uncertified_panics() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-304-ENROLLED-NO-CERT",
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-304-ENROLLED-NO-CERT");
+
+    // Student is enrolled but has not been certified.
+    client.enroll(&student, &course_id);
+
+    // Bulk revoke must still panic because no certificates exist.
+    client.bulk_revoke_course_certificates(&admin, &course_id);
+}
+
+/// #304 — bulk_revoke_course_certificates panics for a course where the only
+/// student enrolled has completed the course but no certificate has been issued yet.
+#[test]
+#[should_panic(expected = "no certificates issued for this course")]
+fn test_bulk_revoke_zero_certs_completed_but_uncertified_panics() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-304-COMPLETED-NO-CERT",
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-304-COMPLETED-NO-CERT");
+    client.enroll(&student, &course_id);
+    client.mark_completed(
+        &admin,
+        &student,
+        &course_id,
+        &Some(String::from_str(&env, "proof-304-no-cert")),
+    );
+
+    // The student completed the course but no certificate was issued — the
+    // CourseCertificates index is still empty.
+    assert_eq!(client.get_course_certificates(&course_id).len(), 0);
+
+    client.bulk_revoke_course_certificates(&admin, &course_id);
+}
+
+/// #304 — After all certificates for a course are revoked and then successfully
+/// challenged (clearing the revocation), the course certificate index still has
+/// the same entries and a subsequent bulk_revoke call now revokes them again
+/// (count equals the number of previously-challenged certificates).
+#[test]
+fn test_bulk_revoke_zero_revocable_after_all_challenged_returns_one() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-304-CHALLENGE",
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-304-CHALLENGE");
+    let cert_id = String::from_str(&env, "CERT-304-CHALLENGE");
+    client.enroll(&student, &course_id);
+    client.mark_completed(
+        &admin,
+        &student,
+        &course_id,
+        &Some(String::from_str(&env, "proof-304-challenge")),
+    );
+    client.issue_certificate(
+        &admin,
+        &student,
+        &course_id,
+        &cert_id,
+        &String::from_str(&env, "Course 304 Challenge"),
+        &get_enrollment_ref(&env, &client, &student, "COURSE-304-CHALLENGE"),
+        &None,
+        &None,
+    );
+
+    // First bulk revoke: 1 certificate is revoked.
+    assert_eq!(client.bulk_revoke_course_certificates(&admin, &course_id), 1);
+
+    // The student successfully challenges the pending revocation.
+    client.challenge_revocation(&student, &cert_id);
+    assert!(client.verify_certificate(&cert_id));
+
+    // After the successful challenge the index still has the entry.
+    assert_eq!(client.get_course_certificates(&course_id).len(), 1);
+
+    // A second bulk revoke now revokes the re-cleared certificate again.
+    assert_eq!(client.bulk_revoke_course_certificates(&admin, &course_id), 1);
+    assert!(
+        client.get_certificate(&admin, &cert_id).revoked
+    );
+}
