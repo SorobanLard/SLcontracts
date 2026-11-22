@@ -102,6 +102,21 @@ fn get_enrollment_ref(
     enrollment.enrollment_ref
 }
 
+/// Count events published by `contract_id` whose first topic is `symbol_name`.
+fn count_events_with_symbol(env: &Env, contract_id: &Address, symbol_name: &str) -> u32 {
+    let mut count = 0u32;
+    for (contract, topics, _data) in env.events().all().iter() {
+        if contract != contract_id {
+            continue;
+        }
+        let sym: Symbol = topics.get(0).unwrap().try_into_val(env).unwrap();
+        if sym == Symbol::new(env, symbol_name) {
+            count += 1;
+        }
+    }
+    count
+}
+
 // ============================================================
 // INIT TESTS
 // ============================================================
@@ -834,6 +849,106 @@ fn test_enrollment_receipt_event_emitted_with_payment_breakdown() {
 
     // Ensure exactly one enrollment event was emitted
     assert_eq!(enrollment_events, 1);
+}
+
+#[test]
+fn test_enroll_emits_student_enrolled_event_with_correct_fields() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    let price: i128 = 500_000_000;
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-ENROLL-EVENT-FIELDS",
+        price,
+    );
+
+    let course_id = String::from_str(&env, "COURSE-ENROLL-EVENT-FIELDS");
+    let ledger_before = env.ledger().sequence();
+
+    client.enroll(&student, &course_id);
+
+    // Verify the student_enrolled event carries the correct course_id,
+    // student address and amount paid.
+    let mut enrollment_events = 0u32;
+    for (contract, topics, data) in env.events().all().iter() {
+        if contract != contract_id {
+            continue;
+        }
+        let sym: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        if sym != Symbol::new(&env, "student_enrolled") {
+            continue;
+        }
+
+        enrollment_events += 1;
+
+        // Topic 1 is the course_id
+        let topic_course_id: String = topics.get(1).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(topic_course_id, course_id);
+
+        // Payload: (student, course_id, amount_paid, platform_fee, instructor_fee, ledger_seq)
+        let (
+            event_student,
+            event_course_id,
+            event_amount,
+            _event_platform_fee,
+            _event_instructor_fee,
+            event_ledger,
+        ): (Address, String, i128, i128, i128, u32) = data.try_into_val(&env).unwrap();
+
+        assert_eq!(event_student, student);
+        assert_eq!(event_course_id, course_id);
+        assert_eq!(event_amount, price); // amount paid
+        assert!(event_ledger >= ledger_before);
+    }
+    assert_eq!(enrollment_events, 1);
+}
+
+#[test]
+fn test_enroll_when_already_enrolled_emits_no_event() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-ENROLL-NO-EVENT",
+        500_000_000,
+    );
+
+    let course_id = String::from_str(&env, "COURSE-ENROLL-NO-EVENT");
+
+    // First enroll succeeds and emits one student_enrolled event.
+    client.enroll(&student, &course_id);
+    assert_eq!(
+        count_events_with_symbol(&env, &contract_id, "student_enrolled"),
+        1
+    );
+
+    // Second enroll on the same course panics ("already enrolled in this
+    // course") and must not emit an additional student_enrolled event.
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.enroll(&student, &course_id);
+    }));
+    assert!(res.is_err(), "re-enroll must panic");
+
+    assert_eq!(
+        count_events_with_symbol(&env, &contract_id, "student_enrolled"),
+        1
+    );
 }
 
 #[test]
