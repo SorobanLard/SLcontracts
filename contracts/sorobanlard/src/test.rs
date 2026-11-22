@@ -8449,6 +8449,135 @@ fn test_upgrade_contract_executes_after_timelock_elapses() {
 }
 
 #[test]
+fn test_upgrade_executed_event_first_upgrade_emits_none_old_wasm_hash() {
+    let (env, contract_id, _token_id, admin, sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let new_wasm_hash = BytesN::from_array(&env, &[0xC3u8; 32]);
+    client.propose_upgrade(&admin, &sec_admin, &new_wasm_hash);
+
+    let timelock = client.get_upgrade_timelock();
+    env.ledger().with_mut(|l| {
+        l.sequence_number += timelock + 1;
+    });
+    let ledger_before = env.ledger().sequence();
+
+    // Native tests cannot upload the proposed Wasm, so `upgrade_contract`
+    // panics at the host Wasm-swap call. The `upgrade_executed` event is
+    // published before that call, so it is observable after catching the
+    // panic.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.upgrade_contract(&admin, &sec_admin);
+    }));
+
+    let mut upgrade_events = 0u32;
+    for (contract, topics, data) in env.events().all().iter() {
+        if contract != contract_id {
+            continue;
+        }
+        let sym: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        if sym != Symbol::new(&env, "upgrade_executed") {
+            continue;
+        }
+        upgrade_events += 1;
+        assert_eq!(topics.len(), 2);
+
+        // Topic 1 is the new Wasm hash
+        let topic_new_hash: BytesN<32> = topics.get(1).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(topic_new_hash, new_wasm_hash);
+
+        // Payload: (old_wasm_hash, new_wasm_hash, admin1, admin2, ledger_seq)
+        let (
+            old_wasm_hash,
+            event_new_hash,
+            event_admin1,
+            event_admin2,
+            event_ledger,
+        ): (Option<BytesN<32>>, BytesN<32>, Address, Address, u32) =
+            data.try_into_val(&env).unwrap();
+
+        // The first upgrade of a deployment has no previous Wasm hash.
+        assert!(old_wasm_hash.is_none());
+        assert_eq!(event_new_hash, new_wasm_hash);
+        assert_eq!(event_admin1, admin);
+        assert_eq!(event_admin2, sec_admin);
+        assert!(event_ledger >= ledger_before);
+    }
+    assert_eq!(upgrade_events, 1);
+}
+
+#[test]
+fn test_upgrade_executed_event_subsequent_upgrade_has_previous_hash_as_old() {
+    let (env, contract_id, _token_id, admin, sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let first_hash = BytesN::from_array(&env, &[0xD1u8; 32]);
+    client.propose_upgrade(&admin, &sec_admin, &first_hash);
+    let timelock = client.get_upgrade_timelock();
+    env.ledger().with_mut(|l| {
+        l.sequence_number += timelock + 1;
+    });
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.upgrade_contract(&admin, &sec_admin);
+    }));
+
+    // Second upgrade: the previously-executed hash must now appear as
+    // old_wasm_hash in the new event.
+    let second_hash = BytesN::from_array(&env, &[0xD2u8; 32]);
+    client.propose_upgrade(&admin, &sec_admin, &second_hash);
+    env.ledger().with_mut(|l| {
+        l.sequence_number += timelock + 1;
+    });
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.upgrade_contract(&admin, &sec_admin);
+    }));
+
+    let mut upgrade_events = 0u32;
+    let mut saw_first_upgrade = false;
+    let mut saw_second_upgrade = false;
+    for (contract, topics, data) in env.events().all().iter() {
+        if contract != contract_id {
+            continue;
+        }
+        let sym: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        if sym != Symbol::new(&env, "upgrade_executed") {
+            continue;
+        }
+        upgrade_events += 1;
+
+        // Payload: (old_wasm_hash, new_wasm_hash, admin1, admin2, ledger_seq)
+        let (
+            old_wasm_hash,
+            event_new_hash,
+            event_admin1,
+            event_admin2,
+            _event_ledger,
+        ): (Option<BytesN<32>>, BytesN<32>, Address, Address, u32) =
+            data.try_into_val(&env).unwrap();
+
+        if event_new_hash == first_hash {
+            assert!(
+                old_wasm_hash.is_none(),
+                "first upgrade must have no old hash"
+            );
+            saw_first_upgrade = true;
+        } else if event_new_hash == second_hash {
+            assert_eq!(
+                old_wasm_hash,
+                Some(first_hash.clone()),
+                "subsequent upgrade must record the previous hash as old_wasm_hash"
+            );
+            assert_eq!(event_admin1, admin);
+            assert_eq!(event_admin2, sec_admin);
+            saw_second_upgrade = true;
+        }
+    }
+    assert_eq!(upgrade_events, 2);
+    assert!(saw_first_upgrade);
+    assert!(saw_second_upgrade);
+}
+
+#[test]
 fn test_cancel_upgrade_authorized() {
     let (env, contract_id, _token_id, admin, sec_admin, _treasury, _instructor) = setup();
     let client = SorobanLardContractClient::new(&env, &contract_id);
