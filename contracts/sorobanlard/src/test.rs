@@ -14895,3 +14895,238 @@ fn test_get_certificate_all_roles_return_identical_data() {
     assert!(!cert_by_instructor.revoked);
     assert!(!cert_by_admin.revoked);
 }
+
+// ============================================================
+// MARK_COMPLETED WITH NON-EMPTY EVIDENCE_HASH TESTS (#302)
+// ============================================================
+
+/// #302 — mark_completed persists a non-empty evidence_hash on the enrollment.
+#[test]
+fn test_mark_completed_evidence_hash_persisted_on_enrollment() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-302-PERSIST",
+        500_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-302-PERSIST");
+    client.enroll(&student, &course_id);
+
+    let evidence = String::from_str(&env, "sha256:abc123def456");
+    client.mark_completed(&admin, &student, &course_id, &Some(evidence.clone()));
+
+    let enrollment = client
+        .get_enrollment(&student, &student, &course_id)
+        .unwrap();
+    assert!(enrollment.completed);
+    assert_eq!(enrollment.evidence_hash, Some(evidence));
+}
+
+/// #302 — mark_completed with evidence_hash does not require the student's auth.
+#[test]
+fn test_mark_completed_evidence_hash_waives_student_auth() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-302-AUTH",
+        500_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-302-AUTH");
+    client.enroll(&student, &course_id);
+
+    let evidence = Some(String::from_str(&env, "ipfs:QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG"));
+
+    // Only mock the admin's signature; the student auth is intentionally absent.
+    client
+        .mock_auths(&[MockAuth {
+            address: &admin,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "mark_completed",
+                args: (
+                    admin.clone(),
+                    student.clone(),
+                    course_id.clone(),
+                    evidence.clone(),
+                )
+                    .into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .mark_completed(&admin, &student, &course_id, &evidence);
+
+    assert_eq!(client.has_completed(&student, &course_id), Some(true));
+    let enrollment = client
+        .get_enrollment(&student, &student, &course_id)
+        .unwrap();
+    assert!(enrollment.evidence_hash.is_some());
+}
+
+/// #302 — mark_completed with a hex-formatted evidence_hash stores the exact string.
+#[test]
+fn test_mark_completed_evidence_hash_exact_value_stored() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-302-HEX",
+        500_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-302-HEX");
+    client.enroll(&student, &course_id);
+
+    let hex_hash = String::from_str(
+        &env,
+        "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+    );
+    client.mark_completed(&admin, &student, &course_id, &Some(hex_hash.clone()));
+
+    let enrollment = client
+        .get_enrollment(&student, &student, &course_id)
+        .unwrap();
+    assert_eq!(enrollment.evidence_hash, Some(hex_hash));
+}
+
+/// #302 — mark_completed with evidence_hash marks the enrollment as completed and
+/// records the ledger sequence at which completion occurred.
+#[test]
+fn test_mark_completed_evidence_hash_records_completed_at_ledger() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-302-LEDGER",
+        500_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-302-LEDGER");
+    client.enroll(&student, &course_id);
+
+    let completion_ledger = env.ledger().sequence();
+    client.mark_completed(
+        &admin,
+        &student,
+        &course_id,
+        &Some(String::from_str(&env, "proof:1234abcd")),
+    );
+
+    let enrollment = client
+        .get_enrollment(&student, &student, &course_id)
+        .unwrap();
+    assert!(enrollment.completed);
+    assert!(enrollment.completed_at_ledger.is_some());
+    assert!(enrollment.completed_at_ledger.unwrap() >= completion_ledger);
+}
+
+/// #302 — mark_completed with evidence_hash enables a subsequent certificate issuance.
+#[test]
+fn test_mark_completed_evidence_hash_enables_certificate_issuance() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-302-CERT",
+        500_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-302-CERT");
+    client.enroll(&student, &course_id);
+    client.mark_completed(
+        &admin,
+        &student,
+        &course_id,
+        &Some(String::from_str(&env, "proof:evidence-hash-302")),
+    );
+
+    let cert_id = String::from_str(&env, "CERT-302-CERT");
+    client.issue_certificate(
+        &admin,
+        &student,
+        &course_id,
+        &cert_id,
+        &String::from_str(&env, "Course 302 Completion"),
+        &get_enrollment_ref(&env, &client, &student, "COURSE-302-CERT"),
+        &None,
+        &None,
+    );
+
+    assert!(client.verify_certificate(&cert_id));
+    let cert = client.get_certificate(&student, &cert_id);
+    assert_eq!(cert.student, student);
+    assert!(!cert.revoked);
+}
+
+/// #302 — mark_completed with evidence_hash decrements the course active_enrollments.
+#[test]
+fn test_mark_completed_evidence_hash_decrements_active_enrollments() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-302-ACTIVE",
+        500_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-302-ACTIVE");
+    client.enroll(&student, &course_id);
+
+    let course_before = client.get_course(&course_id).unwrap();
+    let active_before = course_before.active_enrollments;
+
+    client.mark_completed(
+        &admin,
+        &student,
+        &course_id,
+        &Some(String::from_str(&env, "proof:active-counter-302")),
+    );
+
+    let course_after = client.get_course(&course_id).unwrap();
+    assert_eq!(course_after.active_enrollments, active_before - 1);
+}
