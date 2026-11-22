@@ -1439,6 +1439,146 @@ fn test_event_certificate_revoked() {
 }
 
 #[test]
+fn test_revoke_certificate_emits_certificate_revoked_event_with_correct_id() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    let course_id = String::from_str(&env, "COURSE-REVOKE-EVENT-001");
+    let cert_id = String::from_str(&env, "CERT-REVOKE-EVENT-001");
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-REVOKE-EVENT-001",
+        300_000_000,
+    );
+
+    client.enroll(&student, &course_id);
+    client.mark_completed(
+        &admin,
+        &student,
+        &course_id,
+        &Some(String::from_str(&env, "proof")),
+    );
+    client.issue_certificate(
+        &admin,
+        &student,
+        &course_id,
+        &cert_id,
+        &String::from_str(&env, "Title"),
+        &get_enrollment_ref(&env, &client, &student, "COURSE-REVOKE-EVENT-001"),
+        &None,
+        &None,
+    );
+
+    let ledger_before = env.ledger().sequence();
+    let reason = String::from_str(&env, "ACADEMIC_DISHONESTY");
+    client.revoke_certificate(&admin, &cert_id, &reason);
+
+    let mut revoke_events = 0u32;
+    for (contract, topics, data) in env.events().all().iter() {
+        if contract != contract_id {
+            continue;
+        }
+        let sym: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        if sym != Symbol::new(&env, "certificate_revoked") {
+            continue;
+        }
+        revoke_events += 1;
+
+        // Topic 1 is the certificate_id
+        let topic_cert_id: String = topics.get(1).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(topic_cert_id, cert_id);
+
+        // Payload: (admin, certificate_id, student, course_id, reason, ledger_sequence, deadline)
+        let (
+            event_admin,
+            event_certificate_id,
+            event_student,
+            event_course_id,
+            event_reason,
+            event_ledger,
+            _event_deadline,
+        ): (Address, String, Address, String, String, u32, u32) =
+            data.try_into_val(&env).unwrap();
+
+        assert_eq!(event_admin, admin);
+        assert_eq!(event_certificate_id, cert_id);
+        assert_eq!(event_student, student);
+        assert_eq!(event_course_id, course_id);
+        assert_eq!(event_reason, reason);
+        assert!(event_ledger >= ledger_before);
+    }
+    assert_eq!(revoke_events, 1);
+}
+
+#[test]
+fn test_double_revoke_does_not_emit_second_event() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    let course_id = String::from_str(&env, "COURSE-REVOKE-DBL-001");
+    let cert_id = String::from_str(&env, "CERT-REVOKE-DBL-001");
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-REVOKE-DBL-001",
+        300_000_000,
+    );
+
+    client.enroll(&student, &course_id);
+    client.mark_completed(
+        &admin,
+        &student,
+        &course_id,
+        &Some(String::from_str(&env, "proof")),
+    );
+    client.issue_certificate(
+        &admin,
+        &student,
+        &course_id,
+        &cert_id,
+        &String::from_str(&env, "Title"),
+        &get_enrollment_ref(&env, &client, &student, "COURSE-REVOKE-DBL-001"),
+        &None,
+        &None,
+    );
+
+    let reason = String::from_str(&env, "ACADEMIC_DISHONESTY");
+    client.revoke_certificate(&admin, &cert_id, &reason);
+    assert_eq!(
+        count_events_with_symbol(&env, &contract_id, "certificate_revoked"),
+        1
+    );
+
+    // Revoking an already-revoked certificate panics ("certificate is
+    // already revoked") and must not emit a second certificate_revoked event.
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.revoke_certificate(&admin, &cert_id, &reason);
+    }));
+    assert!(
+        res.is_err(),
+        "revoking an already-revoked certificate must panic"
+    );
+
+    assert_eq!(
+        count_events_with_symbol(&env, &contract_id, "certificate_revoked"),
+        1
+    );
+}
+
+#[test]
 fn test_revoke_certificate_metadata_persisted() {
     let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
     let client = SorobanLardContractClient::new(&env, &contract_id);
