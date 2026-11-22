@@ -4059,6 +4059,111 @@ fn test_get_enrollment_unauthorized_access() {
 }
 
 // ============================================================
+// ISSUE 300: GET ENROLLMENT ACCESS CONTROL (student, admin, third party)
+// ============================================================
+
+/// #300 — `get_enrollment()` is gated by `caller.require_auth()` followed by
+/// a role check: the student themself, the platform admin, or the course's
+/// instructor may read a record; anyone else is a third party and is rejected.
+///
+/// This pins the three named access tiers in one place and adds the
+/// non-obvious cases the original #49 tests leave out: the secondary admin is
+/// NOT the primary admin for access control (`is_admin` only matches
+/// `DataKey::Admin`), so it is a third party; a peer student is a third party
+/// for someone else's enrollment; and an instructor of a *different* course is
+/// a third party for this enrollment.
+#[test]
+fn test_get_enrollment_access_control_student_admin_third_party() {
+    let (env, contract_id, token_id, admin, sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    let peer_student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &1_000_000_000);
+    token::StellarAssetClient::new(&env, &token_id).mint(&peer_student, &1_000_000_000);
+
+    let course_id_str = "COURSE-AC-300";
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        course_id_str,
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, course_id_str);
+    client.enroll(&student, &course_id);
+    client.enroll(&peer_student, &course_id);
+
+    // --- Tier 1: the student may read their own enrollment. ---
+    let own = client
+        .get_enrollment(&student, &student, &course_id)
+        .expect("student must read their own enrollment");
+    assert_eq!(own.student, student);
+    assert_eq!(own.amount_paid, 100_000_000);
+
+    // --- Tier 2: the platform admin may read any student's enrollment. ---
+    let via_admin = client
+        .get_enrollment(&admin, &student, &course_id)
+        .expect("admin must read any student's enrollment");
+    assert_eq!(via_admin.student, student);
+
+    // The course's own instructor is also an authorised reader.
+    let via_instructor = client
+        .get_enrollment(&instructor, &student, &course_id)
+        .expect("course instructor must read the enrollment");
+    assert_eq!(via_instructor.student, student);
+
+    // --- Tier 3: every third party is rejected. ---
+    // A random, unaffiliated address.
+    let stranger = Address::generate(&env);
+    assert!(
+        client
+            .try_get_enrollment(&stranger, &student, &course_id)
+            .is_err(),
+        "an unaffiliated caller is a third party and must be rejected"
+    );
+
+    // A peer student enrolled in the same course is still a third party for
+    // someone else's enrollment.
+    assert!(
+        client
+            .try_get_enrollment(&peer_student, &student, &course_id)
+            .is_err(),
+        "a peer student is a third party for another student's enrollment"
+    );
+
+    // The secondary admin is NOT the primary admin for access control, so it
+    // is treated as a third party.
+    assert!(
+        client
+            .try_get_enrollment(&sec_admin, &student, &course_id)
+            .is_err(),
+        "the secondary admin is not an authorised reader of enrollments"
+    );
+
+    // An instructor of a *different* course is a third party for this course's
+    // enrollment.
+    let other_instructor = Address::generate(&env);
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &other_instructor,
+        "COURSE-AC-300-OTHER",
+        100_000_000,
+    );
+    assert!(
+        client
+            .try_get_enrollment(&other_instructor, &student, &course_id)
+            .is_err(),
+        "an instructor of a different course is a third party"
+    );
+}
+
+// ============================================================
 // ISSUE 47: ARCHIVE-THEN-REREGISTER
 // ============================================================
 
@@ -4123,6 +4228,87 @@ fn test_archive_moves_record_and_get_course_returns_archive_during_cooldown() {
     assert_eq!(
         course_during_cooldown.archived_at_ledger,
         Some(archived_at)
+    );
+}
+
+// ============================================================
+// ISSUE 317: get_course() RETURNS THE ARCHIVED RECORD VIA ArchivedCourse
+// ============================================================
+
+/// #317 — after `archive_course()`, the active `Course` key is removed and the
+/// record lives only under `DataKey::ArchivedCourse`. `get_course()` must
+/// return that archived record (never `None`, never a stale active copy) by
+/// reading it directly from the `ArchivedCourse` storage key.
+#[test]
+fn test_get_course_returns_archived_record_via_archived_key() {
+    use soroban_sdk::xdr::ToXdr;
+
+    let (env, contract_id, token_id, admin, sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let course_id = String::from_str(&env, "COURSE-ARCH-317");
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-ARCH-317",
+        250_000_000,
+    );
+
+    // Archiving requires the course to be paused first.
+    client.pause_course(&admin, &course_id);
+    client.archive_course(&admin, &sec_admin, &course_id, &None);
+
+    // The active key is gone; the record now lives only under ArchivedCourse.
+    let (active_present, archived_present) = env.as_contract(&contract_id, || {
+        (
+            env.storage()
+                .persistent()
+                .has(&DataKey::Course(course_id.clone())),
+            env.storage()
+                .persistent()
+                .has(&DataKey::ArchivedCourse(course_id.clone())),
+        )
+    });
+    assert!(
+        !active_present,
+        "active Course key must be removed on archive"
+    );
+    assert!(
+        archived_present,
+        "ArchivedCourse key must hold the record after archive"
+    );
+
+    // `get_course()` must return the exact record stored under ArchivedCourse.
+    let returned = client
+        .get_course(&course_id)
+        .expect("get_course must return the archived record");
+
+    // Sanity-check the distinguishing fields of an archived record. These
+    // borrow `returned` and must run before the byte-for-byte comparison,
+    // whose `to_xdr(self, ..)` consumes it.
+    assert_eq!(returned.id, course_id);
+    assert_eq!(returned.instructor, instructor);
+    assert_eq!(returned.price, 250_000_000);
+    assert_eq!(returned.status, CourseStatus::Archived);
+    assert!(returned.archived_at_ledger.is_some());
+
+    // The returned record must match the ArchivedCourse storage entry
+    // byte-for-byte, proving get_course read it from the archived key rather
+    // than a stale active copy.
+    let archived_xdr = env.as_contract(&contract_id, || {
+        env.storage()
+            .persistent()
+            .get::<DataKey, Course>(&DataKey::ArchivedCourse(course_id.clone()))
+            .unwrap()
+            .to_xdr(&env)
+    });
+    assert_eq!(
+        returned.to_xdr(&env),
+        archived_xdr,
+        "get_course must return the ArchivedCourse record byte-for-byte"
     );
 }
 
@@ -11770,6 +11956,158 @@ fn test_resolve_arbitration_payout_to_instructor() {
     );
 }
 
+// ============================================================
+// ISSUE 323: arbitration_resolved OUTCOMES (student vs instructor)
+// ============================================================
+
+/// #323 — resolving a dispute in the student's favour emits exactly one
+/// `arbitration_resolved` event whose topic is `resolved_for_student` and
+/// whose payload carries every field of the on-chain case and the resolving
+/// admins, so an indexer can notify both parties from the event alone.
+#[test]
+fn test_arbitration_resolved_event_for_student_outcome() {
+    let (env, contract_id, token_id, admin, sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let fee_per_case = 5_000_000i128;
+    let student = setup_arbitration(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-ARB-323-S",
+        fee_per_case,
+    );
+    let course_id = String::from_str(&env, "COURSE-ARB-323-S");
+
+    client.escalate_to_arbitration(&student, &course_id);
+
+    let reason = String::from_str(&env, "COURSE_NOT_DELIVERED");
+    env.mock_all_auths_allowing_non_root_auth();
+    client.resolve_arbitration(
+        &admin,
+        &sec_admin,
+        &student,
+        &course_id,
+        &true,
+        &reason,
+    );
+    let resolved_at_ledger = env.ledger().sequence();
+
+    let (outcome_topic, event) = get_arbitration_resolved_event(&env, &contract_id);
+
+    // The outcome topic distinguishes a student-win resolution.
+    assert_eq!(
+        outcome_topic,
+        Symbol::new(&env, "resolved_for_student"),
+        "event topic must mark a student-win outcome"
+    );
+    // Every payload field must match the case record and the resolving admins.
+    assert_eq!(event.case_id, course_id, "case_id is the course id");
+    assert_eq!(event.course_id, course_id, "course_id must be carried");
+    assert_eq!(
+        event.caller, student,
+        "caller is the escalating student"
+    );
+    assert_eq!(
+        event.instructor, instructor,
+        "instructor recorded when the case was opened"
+    );
+    assert_eq!(
+        event.outcome,
+        DisputeStatus::ResolvedForStudent,
+        "outcome must be ResolvedForStudent"
+    );
+    assert_eq!(
+        event.fee_paid, fee_per_case,
+        "fee_paid is the escalated arbitration fee"
+    );
+    assert_eq!(event.resolved_by, admin, "admin resolved the case");
+    assert_eq!(
+        event.secondary_admin, sec_admin,
+        "secondary admin co-signed the resolution"
+    );
+    assert_eq!(
+        event.resolved_at_ledger, resolved_at_ledger,
+        "event must record the resolution ledger"
+    );
+
+    // The persisted case record agrees with the event outcome.
+    let case = client.get_arbitration_case(&student, &course_id).unwrap();
+    assert_eq!(case.status, DisputeStatus::ResolvedForStudent);
+    assert_eq!(case.resolved_by, Some(admin));
+    assert_eq!(case.resolution_reason, Some(reason));
+    assert_eq!(case.resolved_at_ledger, Some(resolved_at_ledger));
+}
+
+/// #323 — resolving in the instructor's favour emits the `arbitration_resolved`
+/// event with the `resolved_for_instructor` topic and the same full payload,
+/// so the two outcomes are distinguishable to an indexer that reads only the
+/// event.
+#[test]
+fn test_arbitration_resolved_event_for_instructor_outcome() {
+    let (env, contract_id, token_id, admin, sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let fee_per_case = 5_000_000i128;
+    let student = setup_arbitration(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-ARB-323-I",
+        fee_per_case,
+    );
+    let course_id = String::from_str(&env, "COURSE-ARB-323-I");
+
+    client.escalate_to_arbitration(&student, &course_id);
+
+    let reason = String::from_str(&env, "STUDENT_CLAIM_NOT_SUBSTANTIATED");
+    env.mock_all_auths_allowing_non_root_auth();
+    client.resolve_arbitration(
+        &admin,
+        &sec_admin,
+        &student,
+        &course_id,
+        &false,
+        &reason,
+    );
+    let resolved_at_ledger = env.ledger().sequence();
+
+    let (outcome_topic, event) = get_arbitration_resolved_event(&env, &contract_id);
+
+    // The outcome topic distinguishes an instructor-win resolution.
+    assert_eq!(
+        outcome_topic,
+        Symbol::new(&env, "resolved_for_instructor"),
+        "event topic must mark an instructor-win outcome"
+    );
+    assert_eq!(event.case_id, course_id);
+    assert_eq!(event.course_id, course_id);
+    assert_eq!(event.caller, student, "caller is the escalating student");
+    assert_eq!(
+        event.instructor, instructor,
+        "instructor recorded when the case was opened"
+    );
+    assert_eq!(
+        event.outcome,
+        DisputeStatus::ResolvedForInstructor,
+        "outcome must be ResolvedForInstructor"
+    );
+    assert_eq!(event.fee_paid, fee_per_case);
+    assert_eq!(event.resolved_by, admin);
+    assert_eq!(event.secondary_admin, sec_admin);
+    assert_eq!(event.resolved_at_ledger, resolved_at_ledger);
+
+    let case = client.get_arbitration_case(&student, &course_id).unwrap();
+    assert_eq!(case.status, DisputeStatus::ResolvedForInstructor);
+    assert_eq!(case.resolved_by, Some(admin));
+    assert_eq!(case.resolution_reason, Some(reason));
+    assert_eq!(case.resolved_at_ledger, Some(resolved_at_ledger));
+}
+
 /// A single admin must not be able to finalize a dispute unilaterally —
 /// resolution moves real funds and requires the SecondaryAdmin's co-signature.
 #[test]
@@ -14376,6 +14714,45 @@ fn test_storage_schema_version_defaults_to_current() {
     assert_eq!(
         client.get_storage_schema_version(),
         SorobanLardContract::STORAGE_SCHEMA_VERSION
+    );
+}
+
+/// #315 — before any `migrate()` call, `get_storage_schema_version()` must
+/// return the *initial* schema version. `init()` never writes the
+/// `StorageSchemaVersion` key, so the getter falls back to
+/// `STORAGE_SCHEMA_VERSION_INITIAL`; a freshly initialised contract therefore
+/// reports the initial version rather than a stored one.
+#[test]
+fn test_get_storage_schema_version_returns_initial_value_before_migration() {
+    let (env, contract_id, _token_id, _admin, _sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    // The version key is never written by init(); its absence is what makes
+    // the getter report the initial value via `unwrap_or`.
+    let version_key_present = env.as_contract(&contract_id, || {
+        env.storage()
+            .instance()
+            .has(&DataKey2::StorageSchemaVersion)
+    });
+    assert!(
+        !version_key_present,
+        "init() must not write the schema-version key before a migration"
+    );
+
+    // The getter therefore returns the initial version, not a stored one.
+    assert_eq!(
+        client.get_storage_schema_version(),
+        SorobanLardContract::STORAGE_SCHEMA_VERSION_INITIAL,
+        "a fresh deployment must report the initial schema version"
+    );
+
+    // Today the initial and deployed versions coincide, so the existing
+    // "defaults to current" assertion still holds; this test pins the
+    // *initial* value so a future bump (INITIAL < CURRENT) keeps the default
+    // readable and distinguishable from an upgraded deployment.
+    assert_eq!(
+        SorobanLardContract::STORAGE_SCHEMA_VERSION_INITIAL,
+        SorobanLardContract::STORAGE_SCHEMA_VERSION,
     );
 }
 
