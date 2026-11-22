@@ -14641,3 +14641,257 @@ fn test_course_certificates_index_grows_per_issuance() {
     assert_eq!(final_index.len(), 3);
     assert_eq!(final_index.get(2).unwrap(), String::from_str(&env, "CERT-IDX-320-C"));
 }
+
+// ============================================================
+// GET_CERTIFICATE ACCESS CONTROL TESTS (#301)
+// ============================================================
+
+/// #301 — The student who owns a certificate can retrieve it.
+#[test]
+fn test_get_certificate_student_can_retrieve_own_certificate() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-301-STUDENT",
+        500_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-301-STUDENT");
+    client.enroll(&student, &course_id);
+    client.mark_completed(
+        &admin,
+        &student,
+        &course_id,
+        &Some(String::from_str(&env, "evidence-301-student")),
+    );
+    let cert_id = String::from_str(&env, "CERT-301-STUDENT");
+    client.issue_certificate(
+        &admin,
+        &student,
+        &course_id,
+        &cert_id,
+        &String::from_str(&env, "Course 301 Student"),
+        &get_enrollment_ref(&env, &client, &student, "COURSE-301-STUDENT"),
+        &None,
+        &None,
+    );
+
+    let cert = client.get_certificate(&student, &cert_id);
+    assert_eq!(cert.id, cert_id);
+    assert_eq!(cert.student, student);
+    assert_eq!(cert.course_id, course_id);
+    assert!(!cert.revoked);
+}
+
+/// #301 — The instructor of the course can retrieve any certificate issued for it.
+#[test]
+fn test_get_certificate_instructor_can_retrieve_course_certificate() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-301-INST",
+        500_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-301-INST");
+    client.enroll(&student, &course_id);
+    client.mark_completed(
+        &admin,
+        &student,
+        &course_id,
+        &Some(String::from_str(&env, "evidence-301-inst")),
+    );
+    let cert_id = String::from_str(&env, "CERT-301-INST");
+    client.issue_certificate(
+        &admin,
+        &student,
+        &course_id,
+        &cert_id,
+        &String::from_str(&env, "Course 301 Instructor"),
+        &get_enrollment_ref(&env, &client, &student, "COURSE-301-INST"),
+        &None,
+        &None,
+    );
+
+    let cert = client.get_certificate(&instructor, &cert_id);
+    assert_eq!(cert.id, cert_id);
+    assert_eq!(cert.instructor, instructor);
+    assert_eq!(cert.student, student);
+}
+
+/// #301 — The admin can retrieve any certificate.
+#[test]
+fn test_get_certificate_admin_can_retrieve_any_certificate() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-301-ADMIN",
+        500_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-301-ADMIN");
+    client.enroll(&student, &course_id);
+    client.mark_completed(
+        &admin,
+        &student,
+        &course_id,
+        &Some(String::from_str(&env, "evidence-301-admin")),
+    );
+    let cert_id = String::from_str(&env, "CERT-301-ADMIN");
+    client.issue_certificate(
+        &admin,
+        &student,
+        &course_id,
+        &cert_id,
+        &String::from_str(&env, "Course 301 Admin"),
+        &get_enrollment_ref(&env, &client, &student, "COURSE-301-ADMIN"),
+        &None,
+        &None,
+    );
+
+    let cert = client.get_certificate(&admin, &cert_id);
+    assert_eq!(cert.id, cert_id);
+    assert_eq!(cert.student, student);
+    assert_eq!(cert.issued_by, contract_id);
+}
+
+/// #301 — An unrelated third party cannot retrieve a certificate, even when
+/// all auths are mocked.
+#[test]
+#[should_panic(expected = "unauthorized")]
+fn test_get_certificate_third_party_is_denied() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    let third_party = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-301-DENY",
+        500_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-301-DENY");
+    client.enroll(&student, &course_id);
+    client.mark_completed(
+        &admin,
+        &student,
+        &course_id,
+        &Some(String::from_str(&env, "evidence-301-deny")),
+    );
+    let cert_id = String::from_str(&env, "CERT-301-DENY");
+    client.issue_certificate(
+        &admin,
+        &student,
+        &course_id,
+        &cert_id,
+        &String::from_str(&env, "Course 301 Deny"),
+        &get_enrollment_ref(&env, &client, &student, "COURSE-301-DENY"),
+        &None,
+        &None,
+    );
+
+    // A stranger address is not the student, instructor, or admin — must panic.
+    client.get_certificate(&third_party, &cert_id);
+}
+
+/// #301 — Retrieving a non-existent certificate always panics regardless of caller.
+#[test]
+#[should_panic(expected = "certificate not found")]
+fn test_get_certificate_nonexistent_id_panics() {
+    let (env, contract_id, _token_id, admin, _sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    client.get_certificate(&admin, &String::from_str(&env, "CERT-DOES-NOT-EXIST"));
+}
+
+/// #301 — All three authorised roles (student, instructor, admin) each return
+/// the same certificate data, confirming that the access check is role-based
+/// and not tied to the specific caller instance.
+#[test]
+fn test_get_certificate_all_roles_return_identical_data() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-301-ALL",
+        500_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-301-ALL");
+    client.enroll(&student, &course_id);
+    client.mark_completed(
+        &admin,
+        &student,
+        &course_id,
+        &Some(String::from_str(&env, "evidence-301-all")),
+    );
+    let cert_id = String::from_str(&env, "CERT-301-ALL");
+    client.issue_certificate(
+        &admin,
+        &student,
+        &course_id,
+        &cert_id,
+        &String::from_str(&env, "Course 301 All Roles"),
+        &get_enrollment_ref(&env, &client, &student, "COURSE-301-ALL"),
+        &None,
+        &None,
+    );
+
+    let cert_by_student = client.get_certificate(&student, &cert_id);
+    let cert_by_instructor = client.get_certificate(&instructor, &cert_id);
+    let cert_by_admin = client.get_certificate(&admin, &cert_id);
+
+    // All three callers must receive the same record.
+    assert_eq!(cert_by_student.id, cert_id.clone());
+    assert_eq!(cert_by_instructor.id, cert_id.clone());
+    assert_eq!(cert_by_admin.id, cert_id.clone());
+
+    assert_eq!(cert_by_student.student, student.clone());
+    assert_eq!(cert_by_instructor.student, student.clone());
+    assert_eq!(cert_by_admin.student, student.clone());
+
+    assert_eq!(cert_by_student.course_id, course_id.clone());
+    assert_eq!(cert_by_instructor.course_id, course_id.clone());
+    assert_eq!(cert_by_admin.course_id, course_id.clone());
+
+    assert!(!cert_by_student.revoked);
+    assert!(!cert_by_instructor.revoked);
+    assert!(!cert_by_admin.revoked);
+}
