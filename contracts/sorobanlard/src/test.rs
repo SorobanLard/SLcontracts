@@ -4059,6 +4059,111 @@ fn test_get_enrollment_unauthorized_access() {
 }
 
 // ============================================================
+// ISSUE 300: GET ENROLLMENT ACCESS CONTROL (student, admin, third party)
+// ============================================================
+
+/// #300 — `get_enrollment()` is gated by `caller.require_auth()` followed by
+/// a role check: the student themself, the platform admin, or the course's
+/// instructor may read a record; anyone else is a third party and is rejected.
+///
+/// This pins the three named access tiers in one place and adds the
+/// non-obvious cases the original #49 tests leave out: the secondary admin is
+/// NOT the primary admin for access control (`is_admin` only matches
+/// `DataKey::Admin`), so it is a third party; a peer student is a third party
+/// for someone else's enrollment; and an instructor of a *different* course is
+/// a third party for this enrollment.
+#[test]
+fn test_get_enrollment_access_control_student_admin_third_party() {
+    let (env, contract_id, token_id, admin, sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    let peer_student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &1_000_000_000);
+    token::StellarAssetClient::new(&env, &token_id).mint(&peer_student, &1_000_000_000);
+
+    let course_id_str = "COURSE-AC-300";
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        course_id_str,
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, course_id_str);
+    client.enroll(&student, &course_id);
+    client.enroll(&peer_student, &course_id);
+
+    // --- Tier 1: the student may read their own enrollment. ---
+    let own = client
+        .get_enrollment(&student, &student, &course_id)
+        .expect("student must read their own enrollment");
+    assert_eq!(own.student, student);
+    assert_eq!(own.amount_paid, 100_000_000);
+
+    // --- Tier 2: the platform admin may read any student's enrollment. ---
+    let via_admin = client
+        .get_enrollment(&admin, &student, &course_id)
+        .expect("admin must read any student's enrollment");
+    assert_eq!(via_admin.student, student);
+
+    // The course's own instructor is also an authorised reader.
+    let via_instructor = client
+        .get_enrollment(&instructor, &student, &course_id)
+        .expect("course instructor must read the enrollment");
+    assert_eq!(via_instructor.student, student);
+
+    // --- Tier 3: every third party is rejected. ---
+    // A random, unaffiliated address.
+    let stranger = Address::generate(&env);
+    assert!(
+        client
+            .try_get_enrollment(&stranger, &student, &course_id)
+            .is_err(),
+        "an unaffiliated caller is a third party and must be rejected"
+    );
+
+    // A peer student enrolled in the same course is still a third party for
+    // someone else's enrollment.
+    assert!(
+        client
+            .try_get_enrollment(&peer_student, &student, &course_id)
+            .is_err(),
+        "a peer student is a third party for another student's enrollment"
+    );
+
+    // The secondary admin is NOT the primary admin for access control, so it
+    // is treated as a third party.
+    assert!(
+        client
+            .try_get_enrollment(&sec_admin, &student, &course_id)
+            .is_err(),
+        "the secondary admin is not an authorised reader of enrollments"
+    );
+
+    // An instructor of a *different* course is a third party for this course's
+    // enrollment.
+    let other_instructor = Address::generate(&env);
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &other_instructor,
+        "COURSE-AC-300-OTHER",
+        100_000_000,
+    );
+    assert!(
+        client
+            .try_get_enrollment(&other_instructor, &student, &course_id)
+            .is_err(),
+        "an instructor of a different course is a third party"
+    );
+}
+
+// ============================================================
 // ISSUE 47: ARCHIVE-THEN-REREGISTER
 // ============================================================
 
