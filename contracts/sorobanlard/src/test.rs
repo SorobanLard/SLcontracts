@@ -15049,3 +15049,100 @@ fn test_reject_course_no_event_on_already_active_course() {
         "no course_rejected event should be emitted when rejection panics"
     );
 }
+
+// ============================================================
+// ISSUE #410 — ArchivedCourse TTL extended on read
+// ============================================================
+
+/// Helper: read the persistent TTL of an ArchivedCourse storage entry.
+fn archived_course_ttl(env: &Env, contract_id: &Address, course_id: &String) -> u32 {
+    use soroban_sdk::testutils::storage::Persistent as _;
+    env.as_contract(contract_id, || {
+        env.storage()
+            .persistent()
+            .get_ttl(&DataKey::ArchivedCourse(course_id.clone()))
+    })
+}
+
+/// get_course() on an archived course must extend the ArchivedCourse
+/// persistent storage TTL so the record is not garbage-collected while
+/// it is still being queried.
+#[test]
+fn test_get_course_extends_archived_course_ttl_on_read() {
+    let (env, contract_id, token_id, admin, sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-ARCHIVED-TTL-410",
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-ARCHIVED-TTL-410");
+
+    // Archive the course (must be Paused first, no active enrollments).
+    client.pause_course(&admin, &course_id);
+    client.archive_course(&admin, &sec_admin, &course_id, &None);
+
+    let course = client.get_course(&course_id).unwrap();
+    assert_eq!(course.status, CourseStatus::Archived);
+
+    // Advance ledger so the ArchivedCourse TTL falls below the threshold.
+    env.ledger().with_mut(|l| {
+        l.sequence_number += 400_000;
+    });
+    assert!(
+        archived_course_ttl(&env, &contract_id, &course_id)
+            < SorobanLardContract::PERSISTENT_TTL_THRESHOLD,
+        "ArchivedCourse TTL must be below threshold before the read-extension test"
+    );
+
+    // A read via get_course() must renew the TTL.
+    let _course = client.get_course(&course_id);
+    assert_eq!(
+        archived_course_ttl(&env, &contract_id, &course_id),
+        SorobanLardContract::PERSISTENT_TTL_EXTEND_TO,
+        "get_course() must extend ArchivedCourse TTL to PERSISTENT_TTL_EXTEND_TO"
+    );
+}
+
+/// Repeated reads of an archived course continue extending the TTL,
+/// so the record never expires as long as it is queried regularly.
+#[test]
+fn test_get_course_archived_ttl_extends_on_repeated_reads() {
+    let (env, contract_id, token_id, admin, sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-ARCHIVED-TTL-410B",
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-ARCHIVED-TTL-410B");
+
+    client.pause_course(&admin, &course_id);
+    client.archive_course(&admin, &sec_admin, &course_id, &None);
+
+    // First read-extension cycle.
+    env.ledger().with_mut(|l| l.sequence_number += 400_000);
+    client.get_course(&course_id);
+    assert_eq!(
+        archived_course_ttl(&env, &contract_id, &course_id),
+        SorobanLardContract::PERSISTENT_TTL_EXTEND_TO
+    );
+
+    // Second read-extension cycle — TTL must still reach PERSISTENT_TTL_EXTEND_TO.
+    env.ledger().with_mut(|l| l.sequence_number += 400_000);
+    client.get_course(&course_id);
+    assert_eq!(
+        archived_course_ttl(&env, &contract_id, &course_id),
+        SorobanLardContract::PERSISTENT_TTL_EXTEND_TO
+    );
+}
