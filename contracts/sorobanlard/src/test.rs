@@ -14641,3 +14641,201 @@ fn test_course_certificates_index_grows_per_issuance() {
     assert_eq!(final_index.len(), 3);
     assert_eq!(final_index.get(2).unwrap(), String::from_str(&env, "CERT-IDX-320-C"));
 }
+
+// ============================================================
+// ISSUE #330: storage_migrated EVENT PAYLOAD
+// ============================================================
+
+#[test]
+fn test_migrate_emits_storage_migrated_with_versions_and_ledger() {
+    let (env, contract_id, _token_id, admin, sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    // Simulate storage written by an older schema so migrate() has work to do.
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .instance()
+            .set(&DataKey2::StorageSchemaVersion, &0u32);
+    });
+    env.ledger().with_mut(|l| {
+        l.sequence_number += 42;
+    });
+    let expected_ledger = env.ledger().sequence();
+
+    client.migrate(&admin, &sec_admin);
+
+    let (from_version, to_version, ev_admin1, ev_admin2, ledger_sequence): (
+        u32,
+        u32,
+        Address,
+        Address,
+        u32,
+    ) = last_event_val(&env, &contract_id, "storage_migrated")
+        .try_into_val(&env)
+        .unwrap();
+    assert_eq!(from_version, 0);
+    assert_eq!(to_version, SorobanLardContract::STORAGE_SCHEMA_VERSION);
+    assert_eq!(ev_admin1, admin);
+    assert_eq!(ev_admin2, sec_admin);
+    assert_eq!(ledger_sequence, expected_ledger);
+}
+
+// ============================================================
+// ISSUE #331: admin_transferred EVENT PAYLOAD
+// ============================================================
+
+#[test]
+fn test_transfer_admin_emits_admin_transferred_with_new_admin() {
+    let (env, contract_id, _token_id, admin, sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let new_admin = Address::generate(&env);
+    let new_sec = Address::generate(&env);
+
+    client.transfer_admin(&admin, &sec_admin, &new_admin, &new_sec);
+    client.accept_admin(&new_admin, &new_sec);
+
+    let (contract, topics, data) = env
+        .events()
+        .all()
+        .iter()
+        .rev()
+        .find(|(c, t, _)| {
+            *c == contract_id && {
+                let sym: Symbol = t.get(0).unwrap().try_into_val(&env).unwrap();
+                sym == Symbol::new(&env, "admin_transferred")
+            }
+        })
+        .expect("admin_transferred event not emitted");
+    assert_eq!(contract, contract_id);
+    let topic_admin: Address = topics.get(1).unwrap().try_into_val(&env).unwrap();
+    assert_eq!(topic_admin, new_admin);
+    let (_prev, ev_new_admin, _seq): (Address, Address, u32) = data.try_into_val(&env).unwrap();
+    assert_eq!(ev_new_admin, new_admin);
+}
+
+#[test]
+fn test_admin_transferred_not_emitted_when_transfer_panics() {
+    let (env, contract_id, _token_id, admin, sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    // transfer_admin panics: proposed admins identical to current admins.
+    let res = client.try_transfer_admin(&admin, &sec_admin, &admin, &sec_admin);
+    assert!(res.is_err());
+    assert!(!has_event(&env, &contract_id, "admin_transferred"));
+
+    // accept_admin panics: caller is not the pending admin pair.
+    let new_admin = Address::generate(&env);
+    let new_sec = Address::generate(&env);
+    client.transfer_admin(&admin, &sec_admin, &new_admin, &new_sec);
+    let impostor = Address::generate(&env);
+    let res = client.try_accept_admin(&impostor, &new_sec);
+    assert!(res.is_err());
+    assert!(!has_event(&env, &contract_id, "admin_transferred"));
+}
+
+// ============================================================
+// ISSUE #332: course_paused / course_unpaused EVENT PAYLOADS
+// ============================================================
+
+#[test]
+fn test_pause_course_emits_course_paused_with_course_id() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    register_and_approve_course(
+        &env, &client, &token_id, &admin, &instructor, "COURSE-EV-PAUSE", 100_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-EV-PAUSE");
+
+    client.pause_course(&instructor, &course_id);
+
+    let (ev_course_id, status, caller, _seq): (String, CourseStatus, Address, u32) =
+        last_event_val(&env, &contract_id, "course_paused")
+            .try_into_val(&env)
+            .unwrap();
+    assert_eq!(ev_course_id, course_id);
+    assert_eq!(status, CourseStatus::Paused);
+    assert_eq!(caller, instructor);
+}
+
+#[test]
+fn test_unpause_course_emits_course_unpaused_with_course_id() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    register_and_approve_course(
+        &env, &client, &token_id, &admin, &instructor, "COURSE-EV-UNPAUSE", 100_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-EV-UNPAUSE");
+
+    client.pause_course(&instructor, &course_id);
+    client.unpause_course(&instructor, &course_id);
+
+    let (ev_course_id, status, caller, _seq): (String, CourseStatus, Address, u32) =
+        last_event_val(&env, &contract_id, "course_unpaused")
+            .try_into_val(&env)
+            .unwrap();
+    assert_eq!(ev_course_id, course_id);
+    assert_eq!(status, CourseStatus::Active);
+    assert_eq!(caller, instructor);
+}
+
+#[test]
+fn test_pause_unpause_events_not_emitted_when_caller_unauthorized() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    register_and_approve_course(
+        &env, &client, &token_id, &admin, &instructor, "COURSE-EV-UNAUTH", 100_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-EV-UNAUTH");
+    let stranger = Address::generate(&env);
+
+    let res = client.try_pause_course(&stranger, &course_id);
+    assert!(res.is_err());
+    assert!(!has_event(&env, &contract_id, "course_paused"));
+
+    client.pause_course(&instructor, &course_id);
+
+    let res = client.try_unpause_course(&stranger, &course_id);
+    assert!(res.is_err());
+    assert!(!has_event(&env, &contract_id, "course_unpaused"));
+}
+
+// ============================================================
+// ISSUE #333: course_archived EVENT PAYLOAD
+// ============================================================
+
+#[test]
+fn test_archive_course_emits_course_archived_with_course_id() {
+    let (env, contract_id, token_id, admin, sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    register_and_approve_course(
+        &env, &client, &token_id, &admin, &instructor, "COURSE-EV-ARCHIVE", 100_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-EV-ARCHIVE");
+
+    client.pause_course(&admin, &course_id);
+    client.archive_course(&admin, &sec_admin, &course_id, &None);
+
+    let (ev_course_id, ev_admin1, ev_admin2): (String, Address, Address) =
+        last_event_val(&env, &contract_id, "course_archived")
+            .try_into_val(&env)
+            .unwrap();
+    assert_eq!(ev_course_id, course_id);
+    assert_eq!(ev_admin1, admin);
+    assert_eq!(ev_admin2, sec_admin);
+}
+
+#[test]
+fn test_course_archived_not_emitted_when_archive_course_panics() {
+    let (env, contract_id, token_id, admin, sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    register_and_approve_course(
+        &env, &client, &token_id, &admin, &instructor, "COURSE-EV-ARCHIVE-FAIL", 100_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-EV-ARCHIVE-FAIL");
+
+    // Course is still Active, so archive_course panics.
+    let res = client.try_archive_course(&admin, &sec_admin, &course_id, &None);
+    assert!(res.is_err());
+    assert!(!has_event(&env, &contract_id, "course_archived"));
+}

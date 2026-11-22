@@ -5189,6 +5189,10 @@ impl SorobanLardContract {
             //           storage.set(&key, &Course::from_v1(old));
             //       }
             //   }
+            // Test-only no-op step so tests can exercise a successful
+            // `migrate()` (and its `storage_migrated` event, #330).
+            #[cfg(test)]
+            0 => {}
             _ => panic!("no migration step defined for schema version {}", from_version),
         }
     }
