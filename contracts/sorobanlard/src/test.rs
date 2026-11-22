@@ -11770,6 +11770,158 @@ fn test_resolve_arbitration_payout_to_instructor() {
     );
 }
 
+// ============================================================
+// ISSUE 323: arbitration_resolved OUTCOMES (student vs instructor)
+// ============================================================
+
+/// #323 — resolving a dispute in the student's favour emits exactly one
+/// `arbitration_resolved` event whose topic is `resolved_for_student` and
+/// whose payload carries every field of the on-chain case and the resolving
+/// admins, so an indexer can notify both parties from the event alone.
+#[test]
+fn test_arbitration_resolved_event_for_student_outcome() {
+    let (env, contract_id, token_id, admin, sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let fee_per_case = 5_000_000i128;
+    let student = setup_arbitration(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-ARB-323-S",
+        fee_per_case,
+    );
+    let course_id = String::from_str(&env, "COURSE-ARB-323-S");
+
+    client.escalate_to_arbitration(&student, &course_id);
+
+    let reason = String::from_str(&env, "COURSE_NOT_DELIVERED");
+    env.mock_all_auths_allowing_non_root_auth();
+    client.resolve_arbitration(
+        &admin,
+        &sec_admin,
+        &student,
+        &course_id,
+        &true,
+        &reason,
+    );
+    let resolved_at_ledger = env.ledger().sequence();
+
+    let (outcome_topic, event) = get_arbitration_resolved_event(&env, &contract_id);
+
+    // The outcome topic distinguishes a student-win resolution.
+    assert_eq!(
+        outcome_topic,
+        Symbol::new(&env, "resolved_for_student"),
+        "event topic must mark a student-win outcome"
+    );
+    // Every payload field must match the case record and the resolving admins.
+    assert_eq!(event.case_id, course_id, "case_id is the course id");
+    assert_eq!(event.course_id, course_id, "course_id must be carried");
+    assert_eq!(
+        event.caller, student,
+        "caller is the escalating student"
+    );
+    assert_eq!(
+        event.instructor, instructor,
+        "instructor recorded when the case was opened"
+    );
+    assert_eq!(
+        event.outcome,
+        DisputeStatus::ResolvedForStudent,
+        "outcome must be ResolvedForStudent"
+    );
+    assert_eq!(
+        event.fee_paid, fee_per_case,
+        "fee_paid is the escalated arbitration fee"
+    );
+    assert_eq!(event.resolved_by, admin, "admin resolved the case");
+    assert_eq!(
+        event.secondary_admin, sec_admin,
+        "secondary admin co-signed the resolution"
+    );
+    assert_eq!(
+        event.resolved_at_ledger, resolved_at_ledger,
+        "event must record the resolution ledger"
+    );
+
+    // The persisted case record agrees with the event outcome.
+    let case = client.get_arbitration_case(&student, &course_id).unwrap();
+    assert_eq!(case.status, DisputeStatus::ResolvedForStudent);
+    assert_eq!(case.resolved_by, Some(admin));
+    assert_eq!(case.resolution_reason, Some(reason));
+    assert_eq!(case.resolved_at_ledger, Some(resolved_at_ledger));
+}
+
+/// #323 — resolving in the instructor's favour emits the `arbitration_resolved`
+/// event with the `resolved_for_instructor` topic and the same full payload,
+/// so the two outcomes are distinguishable to an indexer that reads only the
+/// event.
+#[test]
+fn test_arbitration_resolved_event_for_instructor_outcome() {
+    let (env, contract_id, token_id, admin, sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let fee_per_case = 5_000_000i128;
+    let student = setup_arbitration(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-ARB-323-I",
+        fee_per_case,
+    );
+    let course_id = String::from_str(&env, "COURSE-ARB-323-I");
+
+    client.escalate_to_arbitration(&student, &course_id);
+
+    let reason = String::from_str(&env, "STUDENT_CLAIM_NOT_SUBSTANTIATED");
+    env.mock_all_auths_allowing_non_root_auth();
+    client.resolve_arbitration(
+        &admin,
+        &sec_admin,
+        &student,
+        &course_id,
+        &false,
+        &reason,
+    );
+    let resolved_at_ledger = env.ledger().sequence();
+
+    let (outcome_topic, event) = get_arbitration_resolved_event(&env, &contract_id);
+
+    // The outcome topic distinguishes an instructor-win resolution.
+    assert_eq!(
+        outcome_topic,
+        Symbol::new(&env, "resolved_for_instructor"),
+        "event topic must mark an instructor-win outcome"
+    );
+    assert_eq!(event.case_id, course_id);
+    assert_eq!(event.course_id, course_id);
+    assert_eq!(event.caller, student, "caller is the escalating student");
+    assert_eq!(
+        event.instructor, instructor,
+        "instructor recorded when the case was opened"
+    );
+    assert_eq!(
+        event.outcome,
+        DisputeStatus::ResolvedForInstructor,
+        "outcome must be ResolvedForInstructor"
+    );
+    assert_eq!(event.fee_paid, fee_per_case);
+    assert_eq!(event.resolved_by, admin);
+    assert_eq!(event.secondary_admin, sec_admin);
+    assert_eq!(event.resolved_at_ledger, resolved_at_ledger);
+
+    let case = client.get_arbitration_case(&student, &course_id).unwrap();
+    assert_eq!(case.status, DisputeStatus::ResolvedForInstructor);
+    assert_eq!(case.resolved_by, Some(admin));
+    assert_eq!(case.resolution_reason, Some(reason));
+    assert_eq!(case.resolved_at_ledger, Some(resolved_at_ledger));
+}
+
 /// A single admin must not be able to finalize a dispute unilaterally —
 /// resolution moves real funds and requires the SecondaryAdmin's co-signature.
 #[test]
