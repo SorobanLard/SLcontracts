@@ -15146,3 +15146,145 @@ fn test_get_course_archived_ttl_extends_on_repeated_reads() {
         SorobanLardContract::PERSISTENT_TTL_EXTEND_TO
     );
 }
+
+// ============================================================
+// ISSUE #409 — CourseCertificates TTL extended on read
+// ============================================================
+
+/// Helper: read the persistent TTL of a CourseCertificates storage entry.
+fn course_certificates_ttl(env: &Env, contract_id: &Address, course_id: &String) -> u32 {
+    use soroban_sdk::testutils::storage::Persistent as _;
+    env.as_contract(contract_id, || {
+        env.storage()
+            .persistent()
+            .get_ttl(&DataKey::CourseCertificates(course_id.clone()))
+    })
+}
+
+/// get_course_certificates() must extend the CourseCertificates persistent
+/// storage TTL on each read so the index is not garbage-collected while
+/// it is actively queried.
+#[test]
+fn test_get_course_certificates_extends_ttl_on_read() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let course_id_str = "COURSE-CERT-TTL-409-A";
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        course_id_str,
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, course_id_str);
+
+    // Issue one certificate so the CourseCertificates key exists.
+    let student = Address::generate(&env);
+    enroll_and_certify(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &student,
+        course_id_str,
+        "CERT-TTL-409-A",
+    );
+
+    // The key was written at issuance with PERSISTENT_TTL_EXTEND_TO; advancing
+    // 400_000 ledgers drops it below the threshold.
+    env.ledger().with_mut(|l| {
+        l.sequence_number += 400_000;
+    });
+    assert!(
+        course_certificates_ttl(&env, &contract_id, &course_id)
+            < SorobanLardContract::PERSISTENT_TTL_THRESHOLD,
+        "CourseCertificates TTL must be below threshold before read-extension test"
+    );
+
+    // A read via get_course_certificates() must renew the TTL.
+    let certs = client.get_course_certificates(&course_id);
+    assert_eq!(certs.len(), 1);
+    assert_eq!(
+        course_certificates_ttl(&env, &contract_id, &course_id),
+        SorobanLardContract::PERSISTENT_TTL_EXTEND_TO,
+        "get_course_certificates() must extend CourseCertificates TTL to PERSISTENT_TTL_EXTEND_TO"
+    );
+}
+
+/// Repeated reads continue extending the TTL so the index never expires
+/// while it is actively queried.
+#[test]
+fn test_get_course_certificates_ttl_extends_on_repeated_reads() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let course_id_str = "COURSE-CERT-TTL-409-B";
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        course_id_str,
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, course_id_str);
+
+    let student = Address::generate(&env);
+    enroll_and_certify(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &student,
+        course_id_str,
+        "CERT-TTL-409-B",
+    );
+
+    // First cycle.
+    env.ledger().with_mut(|l| l.sequence_number += 400_000);
+    client.get_course_certificates(&course_id);
+    assert_eq!(
+        course_certificates_ttl(&env, &contract_id, &course_id),
+        SorobanLardContract::PERSISTENT_TTL_EXTEND_TO
+    );
+
+    // Second cycle — TTL must still reach PERSISTENT_TTL_EXTEND_TO.
+    env.ledger().with_mut(|l| l.sequence_number += 400_000);
+    client.get_course_certificates(&course_id);
+    assert_eq!(
+        course_certificates_ttl(&env, &contract_id, &course_id),
+        SorobanLardContract::PERSISTENT_TTL_EXTEND_TO
+    );
+}
+
+/// Calling get_course_certificates() for a course with no issued
+/// certificates (key absent) must return an empty list without panicking,
+/// and must not attempt a TTL extension on a non-existent key.
+#[test]
+fn test_get_course_certificates_empty_course_no_ttl_panic() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-CERT-TTL-409-C",
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-CERT-TTL-409-C");
+
+    // No certificates have been issued — the CourseCertificates key does not exist.
+    let certs = client.get_course_certificates(&course_id);
+    assert_eq!(
+        certs.len(),
+        0,
+        "empty course must return an empty certificate list"
+    );
+}
