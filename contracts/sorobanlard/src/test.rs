@@ -14641,3 +14641,282 @@ fn test_course_certificates_index_grows_per_issuance() {
     assert_eq!(final_index.len(), 3);
     assert_eq!(final_index.get(2).unwrap(), String::from_str(&env, "CERT-IDX-320-C"));
 }
+
+// ============================================================
+// STORAGE KEY ENUM BUDGET (#342)
+// ============================================================
+
+#[test]
+fn test_data_key_variant_count_at_or_below_limit() {
+    assert_eq!(DATA_KEY_VARIANT_LIMIT, 50);
+    assert!(DataKey::VARIANT_COUNT > 0);
+    assert!(
+        DataKey::VARIANT_COUNT <= 50,
+        "DataKey has {} variants; the contracttype XDR limit is 50 — add new keys to DataKey2",
+        DataKey::VARIANT_COUNT
+    );
+    assert_eq!(
+        DataKey::VARIANT_HEADROOM,
+        50 - DataKey::VARIANT_COUNT
+    );
+}
+
+#[test]
+fn test_data_key2_overflow_variant_count_at_or_below_limit() {
+    assert!(DataKey2::VARIANT_COUNT > 0);
+    assert!(
+        DataKey2::VARIANT_COUNT <= 50,
+        "DataKey2 has {} variants; the contracttype XDR limit is 50",
+        DataKey2::VARIANT_COUNT
+    );
+    assert_eq!(DataKey2::VARIANT_LIMIT, DataKey::VARIANT_LIMIT);
+    assert_eq!(
+        DataKey2::VARIANT_HEADROOM,
+        50 - DataKey2::VARIANT_COUNT
+    );
+}
+
+// ============================================================
+// STORAGE KEY LAYOUT: INSTANCE VS PERSISTENT (#343)
+// ============================================================
+
+#[test]
+fn test_singleton_config_keys_use_instance_storage() {
+    let (env, contract_id, _token_id, admin, sec_admin, treasury, _instructor) = setup();
+
+    env.as_contract(&contract_id, || {
+        // `DataKey::Admin` doubles as the "initialized" flag checked by init().
+        for (name, key) in [
+            ("Admin", DataKey::Admin),
+            ("SecondaryAdmin", DataKey::SecondaryAdmin),
+            ("Treasury", DataKey::Treasury),
+        ] {
+            assert!(env.storage().instance().has(&key), "{} missing from instance storage", name);
+            assert!(!env.storage().persistent().has(&key), "{} must not be in persistent storage", name);
+            assert!(!env.storage().temporary().has(&key), "{} must not be in temporary storage", name);
+        }
+
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let stored_sec: Address = env.storage().instance().get(&DataKey::SecondaryAdmin).unwrap();
+        let stored_treasury: Address = env.storage().instance().get(&DataKey::Treasury).unwrap();
+        assert_eq!(stored_admin, admin);
+        assert_eq!(stored_sec, sec_admin);
+        assert_eq!(stored_treasury, treasury);
+    });
+}
+
+#[test]
+fn test_per_entity_record_keys_use_persistent_storage() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-LAYOUT-001",
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-LAYOUT-001");
+    let cert_id = String::from_str(&env, "CERT-LAYOUT-001");
+    let student = Address::generate(&env);
+    enroll_and_certify(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &student,
+        "COURSE-LAYOUT-001",
+        "CERT-LAYOUT-001",
+    );
+
+    env.as_contract(&contract_id, || {
+        let keys = [
+            ("Course(id)", DataKey::Course(course_id.clone())),
+            ("Enrollment(student, course_id)", DataKey::Enrollment(student.clone(), course_id.clone())),
+            ("Certificate(id)", DataKey::Certificate(cert_id.clone())),
+        ];
+        for (name, key) in keys {
+            assert!(env.storage().persistent().has(&key), "{} missing from persistent storage", name);
+            assert!(!env.storage().instance().has(&key), "{} must not be in instance storage", name);
+            assert!(!env.storage().temporary().has(&key), "{} must not be in temporary storage", name);
+        }
+    });
+}
+
+// ============================================================
+// TotalActiveEnrollments EXACT ACCOUNTING (#344)
+// ============================================================
+
+#[test]
+fn test_total_active_enrollments_increments_by_exactly_two_for_two_students() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-TAE-INC",
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-TAE-INC");
+
+    let before = client.get_total_active_enrollments();
+    for _ in 0..2 {
+        let student = Address::generate(&env);
+        token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+        client.enroll(&student, &course_id);
+    }
+    assert_eq!(client.get_total_active_enrollments(), before + 2);
+}
+
+#[test]
+fn test_total_active_enrollments_refund_decrements_by_exactly_one() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-TAE-REFUND",
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-TAE-REFUND");
+
+    let before = client.get_total_active_enrollments();
+    let refunded_student = Address::generate(&env);
+    let remaining_student = Address::generate(&env);
+    for student in [&refunded_student, &remaining_student] {
+        token::StellarAssetClient::new(&env, &token_id).mint(student, &100_000_000_000);
+        client.enroll(student, &course_id);
+    }
+    assert_eq!(client.get_total_active_enrollments(), before + 2);
+
+    client.request_refund(&refunded_student, &course_id);
+    client.process_refund(&admin, &refunded_student, &course_id, &true);
+
+    assert_eq!(client.get_total_active_enrollments(), before + 1);
+}
+
+#[test]
+fn test_total_active_enrollments_unchanged_by_bulk_revoke() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-TAE-REVOKE",
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-TAE-REVOKE");
+
+    // Two certified graduates plus one still-active enrollment so the counter is non-zero.
+    for cert_name in ["CERT-TAE-REVOKE-0", "CERT-TAE-REVOKE-1"] {
+        let student = Address::generate(&env);
+        enroll_and_certify(&env, &client, &token_id, &admin, &student, "COURSE-TAE-REVOKE", cert_name);
+    }
+    let active_student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&active_student, &100_000_000_000);
+    client.enroll(&active_student, &course_id);
+
+    let before = client.get_total_active_enrollments();
+    assert!(before >= 1);
+
+    let revoked = client.bulk_revoke_course_certificates(&admin, &course_id);
+    assert_eq!(revoked, 2);
+
+    assert_eq!(client.get_total_active_enrollments(), before);
+}
+
+// ============================================================
+// DataKey2 OVERFLOW KEYS DO NOT COLLIDE WITH DataKey (#345)
+// ============================================================
+
+#[test]
+fn test_data_key2_write_does_not_overwrite_data_key_entries() {
+    let env = Env::default();
+    let contract_id = env.register(SorobanLardContract, ());
+    let id = String::from_str(&env, "COLLIDE-001");
+    let addr = Address::generate(&env);
+
+    env.as_contract(&contract_id, || {
+        // DataKey entries written first, in both storage types. Pairs share
+        // enum position and payload shape with the DataKey2 keys below.
+        env.storage().instance().set(&DataKey::Course(id.clone()), &1u32);
+        env.storage().instance().set(&DataKey::CourseInstructorRef(id.clone()), &2u32);
+        env.storage().instance().set(&DataKey::Enrollment(addr.clone(), id.clone()), &3u32);
+        env.storage().instance().set(&DataKey::Admin, &4u32);
+        env.storage().instance().set(&DataKey::SecondaryAdmin, &5u32);
+        env.storage().persistent().set(&DataKey::Certificate(id.clone()), &6u32);
+        env.storage().persistent().set(&DataKey::StudentBlocked(addr.clone()), &7u32);
+
+        env.storage().instance().set(&DataKey2::HighValueCourseThreshold, &100u32);
+        env.storage().instance().set(&DataKey2::HighValueCourseApproval(id.clone()), &101u32);
+        env.storage().instance().set(&DataKey2::CourseArbitrationCases(id.clone()), &102u32);
+        env.storage().instance().set(&DataKey2::CurrentWasmHash, &103u32);
+        env.storage().instance().set(&DataKey2::StorageSchemaVersion, &104u32);
+        env.storage().persistent().set(&DataKey2::CourseArbitrationCases(id.clone()), &105u32);
+        env.storage().persistent().set(&DataKey2::StudentArbitrationCases(addr.clone()), &106u32);
+
+        let get_i = |k: &DataKey| env.storage().instance().get::<DataKey, u32>(k);
+        let get_p = |k: &DataKey| env.storage().persistent().get::<DataKey, u32>(k);
+        assert_eq!(get_i(&DataKey::Course(id.clone())), Some(1));
+        assert_eq!(get_i(&DataKey::CourseInstructorRef(id.clone())), Some(2));
+        assert_eq!(get_i(&DataKey::Enrollment(addr.clone(), id.clone())), Some(3));
+        assert_eq!(get_i(&DataKey::Admin), Some(4));
+        assert_eq!(get_i(&DataKey::SecondaryAdmin), Some(5));
+        assert_eq!(get_p(&DataKey::Certificate(id.clone())), Some(6));
+        assert_eq!(get_p(&DataKey::StudentBlocked(addr.clone())), Some(7));
+    });
+}
+
+#[test]
+fn test_data_key2_read_after_data_key_write_returns_original_value() {
+    let env = Env::default();
+    let contract_id = env.register(SorobanLardContract, ());
+    let id = String::from_str(&env, "COLLIDE-002");
+    let addr = Address::generate(&env);
+
+    env.as_contract(&contract_id, || {
+        env.storage().instance().set(&DataKey2::HighValueCourseThreshold, &200u32);
+        env.storage().instance().set(&DataKey2::HighValueCourseApproval(id.clone()), &201u32);
+        env.storage().instance().set(&DataKey2::CurrentWasmHash, &202u32);
+        env.storage().instance().set(&DataKey2::StorageSchemaVersion, &203u32);
+        env.storage().persistent().set(&DataKey2::CourseArbitrationCases(id.clone()), &204u32);
+        env.storage().persistent().set(&DataKey2::StudentArbitrationCases(addr.clone()), &205u32);
+
+        // Overwrite every DataKey slot that shares position or payload shape.
+        env.storage().instance().set(&DataKey::Course(id.clone()), &900u32);
+        env.storage().instance().set(&DataKey::CourseInstructorRef(id.clone()), &901u32);
+        env.storage().instance().set(&DataKey::Admin, &902u32);
+        env.storage().instance().set(&DataKey::SecondaryAdmin, &903u32);
+        env.storage().instance().set(&DataKey::AdminExpiresAt, &904u32);
+        env.storage().instance().set(&DataKey::Treasury, &905u32);
+        env.storage().persistent().set(&DataKey::Course(id.clone()), &906u32);
+        env.storage().persistent().set(&DataKey::Certificate(id.clone()), &907u32);
+        env.storage().persistent().set(&DataKey::CourseInstructorRef(id.clone()), &908u32);
+        env.storage().persistent().set(&DataKey::InstructorStats(addr.clone()), &909u32);
+        env.storage().persistent().set(&DataKey::StudentBlocked(addr.clone()), &910u32);
+
+        let get_i = |k: &DataKey2| env.storage().instance().get::<DataKey2, u32>(k);
+        let get_p = |k: &DataKey2| env.storage().persistent().get::<DataKey2, u32>(k);
+        assert_eq!(get_i(&DataKey2::HighValueCourseThreshold), Some(200));
+        assert_eq!(get_i(&DataKey2::HighValueCourseApproval(id.clone())), Some(201));
+        assert_eq!(get_i(&DataKey2::CurrentWasmHash), Some(202));
+        assert_eq!(get_i(&DataKey2::StorageSchemaVersion), Some(203));
+        assert_eq!(get_p(&DataKey2::CourseArbitrationCases(id.clone())), Some(204));
+        assert_eq!(get_p(&DataKey2::StudentArbitrationCases(addr.clone())), Some(205));
+    });
+}
