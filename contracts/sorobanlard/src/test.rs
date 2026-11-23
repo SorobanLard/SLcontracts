@@ -999,6 +999,176 @@ fn test_is_enrolled_check() {
 }
 
 // ============================================================
+// GET_ENROLLMENT COMPLETED FLAG AFTER MARK_COMPLETED (#408)
+// ============================================================
+
+/// #408 — get_enrollment() must return completed = true after mark_completed()
+/// is called, and completed = false before it is called.
+#[test]
+fn test_get_enrollment_returns_completed_true_after_mark_completed() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    let course_id = String::from_str(&env, "COURSE-408-COMPLETED");
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-408-COMPLETED",
+        500_000_000,
+    );
+
+    client.enroll(&student, &course_id);
+
+    // Before mark_completed: enrollment must report completed = false.
+    let enrollment_before = client
+        .get_enrollment(&student, &student, &course_id)
+        .expect("enrollment must exist after enroll()");
+    assert!(
+        !enrollment_before.completed,
+        "completed must be false before mark_completed()"
+    );
+
+    client.mark_completed(
+        &admin,
+        &student,
+        &course_id,
+        &Some(String::from_str(&env, "proof_hash")),
+    );
+
+    // After mark_completed: enrollment must report completed = true.
+    let enrollment_after = client
+        .get_enrollment(&student, &student, &course_id)
+        .expect("enrollment must still be accessible after mark_completed()");
+    assert!(
+        enrollment_after.completed,
+        "get_enrollment must return completed = true after mark_completed()"
+    );
+}
+
+/// #408 — completed_at_ledger must be set to a non-None value in the enrollment
+/// returned by get_enrollment() after mark_completed() is called.
+#[test]
+fn test_get_enrollment_completed_at_ledger_set_after_mark_completed() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    let course_id = String::from_str(&env, "COURSE-408-LEDGER");
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-408-LEDGER",
+        500_000_000,
+    );
+
+    client.enroll(&student, &course_id);
+
+    let completion_ledger = env.ledger().sequence() + 10;
+    env.ledger().with_mut(|l| {
+        l.sequence_number = completion_ledger;
+    });
+
+    client.mark_completed(
+        &admin,
+        &student,
+        &course_id,
+        &Some(String::from_str(&env, "proof_hash_ledger")),
+    );
+
+    let enrollment = client
+        .get_enrollment(&student, &student, &course_id)
+        .unwrap();
+    assert!(
+        enrollment.completed,
+        "enrollment must be completed after mark_completed()"
+    );
+    assert_eq!(
+        enrollment.completed_at_ledger,
+        Some(completion_ledger),
+        "completed_at_ledger must be set to the ledger when mark_completed() ran"
+    );
+}
+
+/// #408 — Calling mark_completed() on behalf of multiple students for the same
+/// course must set completed = true in each student's enrollment independently.
+#[test]
+fn test_get_enrollment_completed_true_for_multiple_students() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let course_id = String::from_str(&env, "COURSE-408-MULTI");
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-408-MULTI",
+        500_000_000,
+    );
+
+    // Enroll two students.
+    let student_a = Address::generate(&env);
+    let student_b = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student_a, &100_000_000_000);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student_b, &100_000_000_000);
+
+    client.enroll(&student_a, &course_id);
+    client.enroll(&student_b, &course_id);
+
+    // Mark only student_a completed; student_b should remain incomplete.
+    client.mark_completed(
+        &admin,
+        &student_a,
+        &course_id,
+        &Some(String::from_str(&env, "proof_a")),
+    );
+
+    let enrollment_a = client
+        .get_enrollment(&student_a, &student_a, &course_id)
+        .unwrap();
+    let enrollment_b = client
+        .get_enrollment(&student_b, &student_b, &course_id)
+        .unwrap();
+
+    assert!(
+        enrollment_a.completed,
+        "student_a enrollment must be completed after mark_completed()"
+    );
+    assert!(
+        !enrollment_b.completed,
+        "student_b enrollment must remain incomplete until mark_completed() is called for them"
+    );
+
+    // Now mark student_b completed.
+    client.mark_completed(
+        &admin,
+        &student_b,
+        &course_id,
+        &Some(String::from_str(&env, "proof_b")),
+    );
+
+    let enrollment_b_after = client
+        .get_enrollment(&student_b, &student_b, &course_id)
+        .unwrap();
+    assert!(
+        enrollment_b_after.completed,
+        "student_b enrollment must be completed after their mark_completed() call"
+    );
+}
+
+// ============================================================
 // COMPLETION & CERTIFICATE TESTS
 // ============================================================
 
@@ -4124,6 +4294,167 @@ fn test_archive_moves_record_and_get_course_returns_archive_during_cooldown() {
         course_during_cooldown.archived_at_ledger,
         Some(archived_at)
     );
+}
+
+// ============================================================
+// COURSELIST CATALOG NOT PRUNED ON ARCHIVAL (#318)
+// ============================================================
+
+/// #318 — After archive_course(), the archived course_id must still be present
+/// in the CourseList vector. Archival moves the record to DataKey::ArchivedCourse
+/// but must never remove the entry from the catalog index.
+#[test]
+fn test_archived_course_id_remains_in_course_list() {
+    let (env, contract_id, token_id, admin, sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-LIST-ARCHIVAL-001",
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-LIST-ARCHIVAL-001");
+
+    // Verify the course appears in CourseList before archiving.
+    let list_before = env.as_contract(&contract_id, || {
+        env.storage()
+            .persistent()
+            .get::<DataKey, soroban_sdk::Vec<String>>(&DataKey::CourseList)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env))
+    });
+    let mut found_before = false;
+    for id in list_before.iter() {
+        if id == course_id {
+            found_before = true;
+            break;
+        }
+    }
+    assert!(found_before, "course_id must be in CourseList after registration");
+
+    // Archive the course (must be paused first).
+    client.pause_course(&admin, &course_id);
+    client.archive_course(&admin, &sec_admin, &course_id, &None);
+
+    // The course_id must still be present in CourseList after archival.
+    let list_after = env.as_contract(&contract_id, || {
+        env.storage()
+            .persistent()
+            .get::<DataKey, soroban_sdk::Vec<String>>(&DataKey::CourseList)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env))
+    });
+    let mut found_after = false;
+    for id in list_after.iter() {
+        if id == course_id {
+            found_after = true;
+            break;
+        }
+    }
+    assert!(
+        found_after,
+        "archive_course must not prune the course_id from CourseList"
+    );
+    // The catalog length must not shrink: archival is non-destructive for the index.
+    assert_eq!(
+        list_before.len(),
+        list_after.len(),
+        "CourseList length must be unchanged after archival"
+    );
+}
+
+/// #318 — get_course() must continue to return the archived record (with
+/// status == Archived) for an archived course_id. The catalog entry must
+/// be queryable even after the active DataKey::Course record is removed.
+#[test]
+fn test_get_course_returns_archived_record_after_archival() {
+    let (env, contract_id, token_id, admin, sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let course_id = String::from_str(&env, "COURSE-LIST-ARCHIVAL-002");
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-LIST-ARCHIVAL-002",
+        200_000_000,
+    );
+
+    // Confirm the course is active before archiving.
+    let course_active = client.get_course(&course_id).unwrap();
+    assert_eq!(course_active.status, CourseStatus::Active);
+
+    client.pause_course(&admin, &course_id);
+    client.archive_course(&admin, &sec_admin, &course_id, &None);
+
+    // DataKey::Course must be gone (moved to DataKey::ArchivedCourse).
+    let active_key_absent = env.as_contract(&contract_id, || {
+        !env.storage()
+            .persistent()
+            .has(&DataKey::Course(course_id.clone()))
+    });
+    assert!(active_key_absent, "DataKey::Course must be removed after archival");
+
+    // get_course() must still return the record via DataKey::ArchivedCourse.
+    let archived = client
+        .get_course(&course_id)
+        .expect("get_course must return the archived record");
+    assert_eq!(archived.id, course_id, "archived record must carry the correct id");
+    assert_eq!(
+        archived.status,
+        CourseStatus::Archived,
+        "archived record must report Archived status"
+    );
+    assert!(
+        archived.archived_at_ledger.is_some(),
+        "archived record must have archived_at_ledger set"
+    );
+}
+
+/// #318 — list_courses() must include an archived course_id in its catalog
+/// pages (since CourseList is not pruned on archival), and get_course() must
+/// return the archived record for that id. This confirms both the index
+/// invariant and the read path work together.
+#[test]
+fn test_list_courses_includes_archived_course_id() {
+    let (env, contract_id, token_id, admin, sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let course_id = String::from_str(&env, "COURSE-LIST-ARCHIVAL-003");
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-LIST-ARCHIVAL-003",
+        150_000_000,
+    );
+
+    client.pause_course(&admin, &course_id);
+    client.archive_course(&admin, &sec_admin, &course_id, &None);
+
+    // list_courses must still return the archived course_id.
+    let page = client.list_courses(&0u32, &SorobanLardContract::MAX_PAGE_SIZE);
+    let mut found = false;
+    for id in page.iter() {
+        if id == course_id {
+            found = true;
+            break;
+        }
+    }
+    assert!(
+        found,
+        "list_courses must include the archived course_id in its results"
+    );
+
+    // And the returned record must have Archived status.
+    let course = client.get_course(&course_id).unwrap();
+    assert_eq!(course.status, CourseStatus::Archived);
 }
 
 // ============================================================
@@ -12205,6 +12536,135 @@ fn test_arbitration_timeout_cannot_claim_resolved_case() {
 }
 
 // ============================================================
+// ARBITRATION CASE TIMEOUT AUTO-REFUND (#322)
+// ============================================================
+
+/// #322 — After ARBITRATION_TIMEOUT_LEDGERS elapse, claim_arbitration_timeout()
+/// must trigger an auto-refund and transition the case to AutoRefunded.
+#[test]
+fn test_arbitration_auto_refund_triggers_after_window_elapses() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let fee_per_case = 10_000_000i128;
+    let student = setup_arbitration(
+        &env, &client, &token_id, &admin, &instructor, "COURSE-322-TIMEOUT", fee_per_case,
+    );
+    let course_id = String::from_str(&env, "COURSE-322-TIMEOUT");
+
+    client.escalate_to_arbitration(&student, &course_id);
+
+    let case = client.get_arbitration_case(&student, &course_id).unwrap();
+    let timeout_at = case.opened_at_ledger + SorobanLardContract::ARBITRATION_TIMEOUT_LEDGERS;
+
+    // One ledger before the timeout: auto-refund must not yet be claimable.
+    env.ledger().with_mut(|l| {
+        l.sequence_number = timeout_at - 1;
+    });
+    assert!(
+        client
+            .try_claim_arbitration_timeout(&student, &course_id)
+            .is_err(),
+        "auto-refund must not trigger before the arbitration window has elapsed"
+    );
+
+    // Advance to exactly the timeout boundary.
+    env.ledger().with_mut(|l| {
+        l.sequence_number = timeout_at;
+    });
+    env.mock_all_auths_allowing_non_root_auth();
+
+    // claim_arbitration_timeout must succeed once the window has elapsed.
+    client.claim_arbitration_timeout(&student, &course_id);
+
+    let resolved_case = client.get_arbitration_case(&student, &course_id).unwrap();
+    assert_eq!(
+        resolved_case.status,
+        DisputeStatus::AutoRefunded,
+        "case must transition to AutoRefunded after the timeout"
+    );
+}
+
+/// #322 — The escalation fee must be fully transferred back to the escalating
+/// caller when claim_arbitration_timeout() fires.
+#[test]
+fn test_arbitration_auto_refund_returns_fee_to_caller() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let fee_per_case = 7_500_000i128;
+    let student = setup_arbitration(
+        &env, &client, &token_id, &admin, &instructor, "COURSE-322-FEE-RETURN", fee_per_case,
+    );
+    let course_id = String::from_str(&env, "COURSE-322-FEE-RETURN");
+
+    client.escalate_to_arbitration(&student, &course_id);
+
+    let token_client = token::Client::new(&env, &token_id);
+    // Record balance after escalation (fee has been pulled from the caller).
+    let balance_after_escalation = token_client.balance(&student);
+
+    let case = client.get_arbitration_case(&student, &course_id).unwrap();
+    let timeout_at = case.opened_at_ledger + SorobanLardContract::ARBITRATION_TIMEOUT_LEDGERS;
+
+    env.ledger().with_mut(|l| {
+        l.sequence_number = timeout_at;
+    });
+    env.mock_all_auths_allowing_non_root_auth();
+
+    client.claim_arbitration_timeout(&student, &course_id);
+
+    let balance_after_refund = token_client.balance(&student);
+    assert_eq!(
+        balance_after_refund - balance_after_escalation,
+        fee_per_case,
+        "claim_arbitration_timeout must refund the full escalation fee to the caller"
+    );
+}
+
+/// #322 — claim_arbitration_timeout() must emit an `arbitration_auto_refunded`
+/// event with the correct caller, course_id, fee, and ledger sequence.
+#[test]
+fn test_arbitration_auto_refund_emits_event_with_correct_payload() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let fee_per_case = 3_000_000i128;
+    let student = setup_arbitration(
+        &env, &client, &token_id, &admin, &instructor, "COURSE-322-EVENT", fee_per_case,
+    );
+    let course_id = String::from_str(&env, "COURSE-322-EVENT");
+
+    client.escalate_to_arbitration(&student, &course_id);
+
+    let case = client.get_arbitration_case(&student, &course_id).unwrap();
+    let timeout_at = case.opened_at_ledger + SorobanLardContract::ARBITRATION_TIMEOUT_LEDGERS;
+
+    env.ledger().with_mut(|l| {
+        l.sequence_number = timeout_at;
+    });
+    env.mock_all_auths_allowing_non_root_auth();
+
+    client.claim_arbitration_timeout(&student, &course_id);
+
+    let (event_caller, event_course, event_fee, event_ledger): (Address, String, i128, u32) =
+        last_event_val(&env, &contract_id, "arbitration_auto_refunded")
+            .try_into_val(&env)
+            .unwrap();
+
+    assert_eq!(event_caller, student, "event must name the escalating caller");
+    assert_eq!(event_course, course_id, "event must name the dispute course");
+    assert_eq!(
+        event_fee, fee_per_case,
+        "event must report the full escalation fee"
+    );
+    assert_eq!(
+        event_ledger, timeout_at,
+        "event ledger must equal the timeout boundary ledger"
+    );
+}
+
+// ============================================================
 // REFUND ENROLLMENT ARCHIVAL  (#254)
 // ============================================================
 
@@ -14396,6 +14856,51 @@ fn test_migrate_unauthorized_fails() {
 
     let random = Address::generate(&env);
     client.migrate(&admin, &random);
+}
+
+// ============================================================
+// MIGRATE REPEATED-CALL PANIC TESTS (#316)
+// ============================================================
+
+/// #316 — migrate() must panic if the stored schema version already equals
+/// STORAGE_SCHEMA_VERSION, so a second call after a successful migration (or
+/// after fresh deployment) is always rejected.
+///
+/// We simulate a schema that is already at the current version by patching
+/// StorageSchemaVersion to the current value, then verify that every subsequent
+/// call to migrate() panics with the documented message.
+#[test]
+#[should_panic(expected = "storage already at current schema version")]
+fn test_migrate_panics_on_repeated_call_when_schema_already_current() {
+    let (env, contract_id, _token_id, admin, sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    // The contract starts with the schema already at STORAGE_SCHEMA_VERSION
+    // (the initial version equals the current version, so no migration step
+    // is pending). A call to migrate() must therefore panic immediately.
+    // This is equivalent to a second call that follows a completed migration.
+    client.migrate(&admin, &sec_admin);
+}
+
+/// #316 — Explicitly sets StorageSchemaVersion to the current value via
+/// as_contract, then calls migrate() — must still panic, confirming that
+/// the guard fires regardless of how the version reached the current value.
+#[test]
+#[should_panic(expected = "storage already at current schema version")]
+fn test_migrate_panics_on_repeated_call_after_manual_version_advance() {
+    let (env, contract_id, _token_id, admin, sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    // Explicitly write the current schema version into storage to simulate
+    // a state where a previous successful migration has already run.
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .instance()
+            .set(&DataKey2::StorageSchemaVersion, &SorobanLardContract::STORAGE_SCHEMA_VERSION);
+    });
+
+    // A repeated migrate() call must be rejected.
+    client.migrate(&admin, &sec_admin);
 }
 
 #[test]
