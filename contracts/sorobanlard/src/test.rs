@@ -116,6 +116,23 @@ fn test_init_success() {
 }
 
 #[test]
+fn test_get_platform_fee_admin_can_read() {
+    let (env, contract_id, _token_id, admin, _sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    assert_eq!(client.get_platform_fee(&admin), 20);
+}
+
+#[test]
+#[should_panic(expected = "unauthorized: get_platform_fee - caller is not admin")]
+fn test_get_platform_fee_non_admin_rejected() {
+    let (env, contract_id, _token_id, _admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    client.get_platform_fee(&instructor);
+}
+
+#[test]
 fn test_admin_instance_ttl_extended_on_admin_ops() {
     let (env, contract_id, token_id, admin, sec_admin, treasury, instructor) = setup();
     let client = SorobanLardContractClient::new(&env, &contract_id);
