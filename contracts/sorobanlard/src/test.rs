@@ -11845,6 +11845,103 @@ fn test_resolve_arbitration_requires_secondary_admin_cosignature() {
 }
 
 // ============================================================
+// PAYMENT SPLIT LOSSLESSNESS TESTS (#369)
+// ============================================================
+
+/// Enrolls a student in a course priced at `price` with the given per-token
+/// fee in basis points and returns the recorded enrollment.
+fn enroll_and_get_split(
+    env: &Env,
+    client: &SorobanLardContractClient,
+    token_id: &Address,
+    admin: &Address,
+    instructor: &Address,
+    course_id: &str,
+    price: i128,
+    fee_bps: u32,
+) -> Enrollment {
+    client.set_fee_config(admin, token_id, &fee_bps);
+    register_and_approve_course(env, client, token_id, admin, instructor, course_id, price);
+
+    let student = Address::generate(env);
+    token::StellarAssetClient::new(env, token_id).mint(&student, &price);
+    client.enroll(&student, &String::from_str(env, course_id));
+
+    client
+        .get_enrollment(&student, &student, &String::from_str(env, course_id))
+        .expect("enrollment must exist")
+}
+
+/// The split recorded on the enrollment is lossless for integer prices:
+/// `platform_amount + instructor_amount == price`.
+#[test]
+fn test_payment_split_is_lossless_for_integer_prices() {
+    let (env, contract_id, token_id, admin, _sec_admin, treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    for (i, price) in [1i128, 7, 99, 100, 101, 999, 1_000, 12_345, 500_000_000].iter() {
+        let course_id = format!("SPLIT-INT-{}", i);
+        let enrollment = enroll_and_get_split(
+            &env,
+            &client,
+            &token_id,
+            &admin,
+            &instructor,
+            &course_id,
+            *price,
+            2_000,
+        );
+
+        assert_eq!(enrollment.amount_paid, *price);
+        assert_eq!(
+            enrollment.platform_amount + enrollment.instructor_amount,
+            *price,
+            "split must be lossless for price {}",
+            price
+        );
+        assert!(enrollment.platform_amount >= 0);
+        assert!(enrollment.instructor_amount >= 0);
+        assert_eq!(
+            token::Client::new(&env, &token_id).balance(&treasury),
+            enrollment.platform_amount
+        );
+    }
+}
+
+/// Prices that are not evenly divisible by 100 lose no stroop: the integer
+/// division remainder stays with the instructor share.
+#[test]
+fn test_payment_split_loses_no_stroop_when_price_not_divisible_by_100() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    // 20% platform fee: 1_001 * 2000 / 10000 = 200 (remainder 200 stroops).
+    let price = 1_001i128;
+    let enrollment = enroll_and_get_split(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "SPLIT-ODD",
+        price,
+        2_000,
+    );
+
+    assert_eq!(enrollment.platform_amount, 200);
+    assert_eq!(enrollment.instructor_amount, 801);
+    assert_eq!(
+        enrollment.platform_amount + enrollment.instructor_amount,
+        price,
+        "no stroop may be lost on a non-divisible price"
+    );
+    assert_eq!(
+        client.get_instructor_earnings(&instructor, &token_id),
+        enrollment.instructor_amount
+    );
+}
+
+// ============================================================
 // FULL-LIFECYCLE DISPUTE INTEGRATION TESTS
 // ============================================================
 
