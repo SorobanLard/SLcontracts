@@ -1147,6 +1147,89 @@ fn test_full_lifecycle_enroll_complete_certify() {
 }
 
 #[test]
+fn test_get_enrollment_certificate_issued_false_before_issue_certificate() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    let course_id = String::from_str(&env, "COURSE-CERT-FLAG-001");
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-CERT-FLAG-001",
+        500_000_000,
+    );
+
+    client.enroll(&student, &course_id);
+    client.mark_completed(
+        &admin,
+        &student,
+        &course_id,
+        &Some(String::from_str(&env, "completion-proof")),
+    );
+
+    let enrollment = client
+        .get_enrollment(&student, &student, &course_id)
+        .unwrap();
+    assert!(!enrollment.certificate_issued);
+}
+
+#[test]
+fn test_get_enrollment_certificate_issued_true_after_issue_certificate() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    let course_id = String::from_str(&env, "COURSE-CERT-FLAG-002");
+    let cert_id = String::from_str(&env, "CERT-FLAG-002");
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-CERT-FLAG-002",
+        500_000_000,
+    );
+
+    client.enroll(&student, &course_id);
+    client.mark_completed(
+        &admin,
+        &student,
+        &course_id,
+        &Some(String::from_str(&env, "completion-proof")),
+    );
+
+    let before = client
+        .get_enrollment(&student, &student, &course_id)
+        .unwrap();
+    assert!(!before.certificate_issued);
+
+    client.issue_certificate(
+        &admin,
+        &student,
+        &course_id,
+        &cert_id,
+        &String::from_str(&env, "Certificate Flag Test"),
+        &before.enrollment_ref,
+        &None,
+        &None,
+    );
+
+    let after = client
+        .get_enrollment(&student, &student, &course_id)
+        .unwrap();
+    assert!(after.certificate_issued);
+}
+
+#[test]
 fn test_certificate_issued_event_contains_full_issuance_details() {
     let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
     let client = SorobanLardContractClient::new(&env, &contract_id);
