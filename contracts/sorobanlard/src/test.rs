@@ -1233,6 +1233,116 @@ fn test_certificate_requires_completion() {
 }
 
 #[test]
+#[should_panic(expected = "certificate ID already exists")]
+fn test_issue_certificate_panics_on_duplicate_certificate_id() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student_a = Address::generate(&env);
+    let student_b = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student_a, &100_000_000_000);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student_b, &100_000_000_000);
+
+    let course_id = String::from_str(&env, "COURSE-DUP-CERT-001");
+    let cert_id = String::from_str(&env, "CERT-DUPLICATE-001");
+    let course_title = String::from_str(&env, "Duplicate Certificate Course");
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-DUP-CERT-001",
+        500_000_000,
+    );
+
+    for student in [&student_a, &student_b] {
+        client.enroll(student, &course_id);
+        client.mark_completed(
+            &admin,
+            student,
+            &course_id,
+            &Some(String::from_str(&env, "completion-proof")),
+        );
+    }
+
+    client.issue_certificate(
+        &admin,
+        &student_a,
+        &course_id,
+        &cert_id,
+        &course_title,
+        &get_enrollment_ref(&env, &client, &student_a, "COURSE-DUP-CERT-001"),
+        &None,
+        &None,
+    );
+    assert!(client.verify_certificate(&cert_id));
+
+    // Reusing the same certificate_id for another completed enrollment must panic
+    client.issue_certificate(
+        &admin,
+        &student_b,
+        &course_id,
+        &cert_id,
+        &course_title,
+        &get_enrollment_ref(&env, &client, &student_b, "COURSE-DUP-CERT-001"),
+        &None,
+        &None,
+    );
+}
+
+#[test]
+fn test_issue_certificate_succeeds_with_unique_certificate_id() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    let course_id = String::from_str(&env, "COURSE-UNIQ-CERT-001");
+    let cert_id = String::from_str(&env, "CERT-UNIQUE-001");
+    let course_title = String::from_str(&env, "Unique Certificate Course");
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-UNIQ-CERT-001",
+        500_000_000,
+    );
+
+    client.enroll(&student, &course_id);
+    client.mark_completed(
+        &admin,
+        &student,
+        &course_id,
+        &Some(String::from_str(&env, "completion-proof")),
+    );
+
+    let returned_id = client.issue_certificate(
+        &admin,
+        &student,
+        &course_id,
+        &cert_id,
+        &course_title,
+        &get_enrollment_ref(&env, &client, &student, "COURSE-UNIQ-CERT-001"),
+        &None,
+        &None,
+    );
+
+    assert_eq!(returned_id, cert_id);
+    assert!(client.verify_certificate(&cert_id));
+    let cert = client.get_certificate(&admin, &cert_id);
+    assert_eq!(cert.id, cert_id);
+    assert_eq!(cert.student, student);
+    assert_eq!(cert.course_id, course_id);
+    assert!(!cert.revoked);
+}
+
+#[test]
 fn test_revoke_certificate() {
     let (env, contract_id, token_id, admin, sec_admin, _treasury, instructor) = setup();
     let client = SorobanLardContractClient::new(&env, &contract_id);
