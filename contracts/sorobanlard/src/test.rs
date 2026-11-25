@@ -4995,6 +4995,95 @@ fn test_re_enroll_archives_original_completion_and_certificate() {
     );
 }
 
+#[test]
+fn test_get_enrollment_enrolled_at_ledger_matches_current_ledger() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &10_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-ENROLLED-LEDGER-001",
+        500_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-ENROLLED-LEDGER-001");
+
+    let enroll_ledger = env.ledger().sequence() + 42;
+    env.ledger().with_mut(|l| {
+        l.sequence_number = enroll_ledger;
+    });
+
+    client.enroll(&student, &course_id);
+
+    let enrollment = client
+        .get_enrollment(&student, &student, &course_id)
+        .unwrap();
+    assert_eq!(enrollment.enrolled_at_ledger, enroll_ledger);
+    assert_eq!(enrollment.enrolled_at_ledger, env.ledger().sequence());
+}
+
+#[test]
+fn test_re_enroll_updates_enrolled_at_ledger() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &10_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-ENROLLED-LEDGER-002",
+        500_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-ENROLLED-LEDGER-002");
+
+    let first_ledger = env.ledger().sequence() + 10;
+    env.ledger().with_mut(|l| {
+        l.sequence_number = first_ledger;
+    });
+
+    client.enroll(&student, &course_id);
+    client.mark_completed(
+        &admin,
+        &student,
+        &course_id,
+        &Some(String::from_str(&env, "evidence_1")),
+    );
+
+    let first = client
+        .get_enrollment(&student, &student, &course_id)
+        .unwrap();
+    assert_eq!(first.enrolled_at_ledger, first_ledger);
+
+    let second_ledger = first_ledger + 100;
+    env.ledger().with_mut(|l| {
+        l.sequence_number = second_ledger;
+    });
+
+    client.re_enroll(&student, &course_id);
+
+    let second = client
+        .get_enrollment(&student, &student, &course_id)
+        .unwrap();
+    assert_eq!(second.enrolled_at_ledger, second_ledger);
+    assert_ne!(second.enrolled_at_ledger, first.enrolled_at_ledger);
+
+    // The archived record keeps the original enrollment ledger
+    let history = client.get_enrollment_history(&student, &student, &course_id);
+    assert_eq!(history.len(), 1);
+    assert_eq!(history.get(0).unwrap().enrolled_at_ledger, first_ledger);
+}
+
 // ============================================================
 // ISSUE 99: ADMIN ATTRIBUTION ON EVENTS
 // ============================================================
