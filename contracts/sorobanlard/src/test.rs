@@ -6962,6 +6962,48 @@ fn test_register_course_distinct_hashes_stored_independently() {
 }
 
 #[test]
+fn test_get_course_returns_content_hash_after_approval() {
+    // The hash must survive the pending -> active transition and be
+    // retrievable via get_course for an approved course.
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let hash = BytesN::from_array(&env, &[0x5Au8; 32]);
+    let course_id = String::from_str(&env, "COURSE-HASH-APPROVED");
+
+    client.register_course(
+        &instructor,
+        &course_id,
+        &100_000_000,
+        &token_id,
+        &0u32,
+        &None,
+        &hash,
+        &soroban_sdk::Vec::new(&env),
+    );
+
+    let pending = client.get_course(&course_id).unwrap();
+    assert_eq!(pending.content_hash, hash);
+
+    client.approve_course(&admin, &course_id);
+
+    let active = client.get_course(&course_id).unwrap();
+    assert_eq!(active.content_hash, hash);
+    assert_eq!(active.status, CourseStatus::Active);
+}
+
+#[test]
+fn test_get_course_returns_none_for_unknown_course_hash() {
+    // A course that was never registered must not surface a content_hash.
+    let (env, contract_id, _token_id, _admin, _sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    assert!(client
+        .get_course(&String::from_str(&env, "COURSE-HASH-MISSING"))
+        .is_none());
+}
+
+#[test]
 fn test_instructor_can_update_content_hash_on_active_course() {
     let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
     let client = SorobanLardContractClient::new(&env, &contract_id);
