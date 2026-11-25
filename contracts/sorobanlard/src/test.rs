@@ -998,6 +998,70 @@ fn test_is_enrolled_check() {
     assert!(client.is_enrolled(&student, &course_id));
 }
 
+#[test]
+fn test_is_enrolled_admin_can_query_any_student() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student_a = Address::generate(&env);
+    let student_b = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student_a, &100_000_000_000);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student_b, &100_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-ADMIN-QUERY",
+        300_000_000,
+    );
+
+    let course_id = String::from_str(&env, "COURSE-ADMIN-QUERY");
+    let other_course_id = String::from_str(&env, "COURSE-ADMIN-QUERY-OTHER");
+
+    // Admin can query any student, enrolled or not, without authorization.
+    assert!(!client.is_enrolled(&student_a, &course_id));
+    assert!(!client.is_enrolled(&student_b, &course_id));
+
+    client.enroll(&student_a, &course_id);
+
+    assert!(client.is_enrolled(&student_a, &course_id));
+    assert!(!client.is_enrolled(&student_b, &course_id));
+    assert!(!client.is_enrolled(&student_a, &other_course_id));
+}
+
+#[test]
+fn test_is_enrolled_third_party_query_is_read_only() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    let third_party = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-THIRD-PARTY",
+        300_000_000,
+    );
+
+    let course_id = String::from_str(&env, "COURSE-THIRD-PARTY");
+    client.enroll(&student, &course_id);
+
+    // is_enrolled is a read-only view: it requires no auth, so a third party
+    // who is neither the student nor an admin gets the same answer and cannot
+    // mutate enrollment state.
+    assert!(client.is_enrolled(&student, &course_id));
+    assert!(!client.is_enrolled(&third_party, &course_id));
+    assert!(client.is_enrolled(&student, &course_id));
+}
+
 // ============================================================
 // COMPLETION & CERTIFICATE TESTS
 // ============================================================
