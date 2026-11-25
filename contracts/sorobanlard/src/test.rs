@@ -9066,6 +9066,152 @@ fn test_issue_146_configurable_challenge_period() {
     let deadline = cert.revocation_deadline.unwrap();
     assert_eq!(deadline, ledger_before + 5);
 }
+
+/// Issue a certificate for `student` on a freshly registered course and
+/// return the certificate id.
+fn issue_test_certificate(
+    env: &Env,
+    client: &SorobanLardContractClient,
+    token_id: &Address,
+    admin: &Address,
+    instructor: &Address,
+    course: &str,
+    cert: &str,
+) -> (Address, String) {
+    let student = Address::generate(env);
+    token::StellarAssetClient::new(env, token_id).mint(&student, &100_000_000_000);
+
+    register_and_approve_course(env, client, token_id, admin, instructor, course, 500_000_000);
+
+    let course_id = String::from_str(env, course);
+    let cert_id = String::from_str(env, cert);
+
+    client.enroll(&student, &course_id);
+    client.mark_completed(admin, &student, &course_id, &None);
+    client.issue_certificate(
+        admin,
+        &student,
+        &course_id,
+        &cert_id,
+        &String::from_str(env, "Course"),
+        &get_enrollment_ref(env, client, &student, course),
+        &None,
+        &None,
+    );
+
+    (student, cert_id)
+}
+
+#[test]
+fn test_issue_383_update_challenge_period_shorter_window_challenge_succeeds() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let (student, cert_id) = issue_test_certificate(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-383-SHORT-OK",
+        "CERT-383-SHORT-OK",
+    );
+
+    // Shrink the challenge window from 17_280 to 10 ledgers.
+    client.update_revocation_challenge_period(&admin, &10u32);
+    assert_eq!(client.get_revocation_challenge_period(), 10);
+
+    let revoke_ledger = env.ledger().sequence();
+    client.revoke_certificate(&admin, &cert_id, &String::from_str(&env, "TEST"));
+
+    let cert = client.get_certificate(&admin, &cert_id);
+    assert_eq!(cert.revocation_deadline, Some(revoke_ledger + 10));
+
+    // A challenge inside the new, shorter window still succeeds.
+    env.ledger().with_mut(|l| {
+        l.sequence_number = revoke_ledger + 9;
+    });
+    client.challenge_revocation(&student, &cert_id);
+
+    let cert = client.get_certificate(&admin, &cert_id);
+    assert!(!cert.revoked);
+    assert!(cert.revocation_deadline.is_none());
+    assert!(client.verify_certificate(&cert_id));
+}
+
+#[test]
+#[should_panic(expected = "revocation challenge period has expired")]
+fn test_issue_383_update_challenge_period_shorter_window_challenge_rejected() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let (student, cert_id) = issue_test_certificate(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-383-SHORT-LATE",
+        "CERT-383-SHORT-LATE",
+    );
+
+    client.update_revocation_challenge_period(&admin, &10u32);
+
+    let revoke_ledger = env.ledger().sequence();
+    client.revoke_certificate(&admin, &cert_id, &String::from_str(&env, "TEST"));
+
+    // Ledger 15 is inside the old 17_280 window but outside the new 10-ledger
+    // window, so the challenge must be rejected.
+    env.ledger().with_mut(|l| {
+        l.sequence_number = revoke_ledger + 15;
+    });
+    client.challenge_revocation(&student, &cert_id);
+}
+
+#[test]
+fn test_issue_383_pre_existing_certificate_uses_period_at_revocation_time() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    // Certificate is issued while the default (17_280) period is active.
+    let (student, cert_id) = issue_test_certificate(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-383-PREEXIST",
+        "CERT-383-PREEXIST",
+    );
+
+    // Revoke while the default period is still active.
+    let revoke_ledger = env.ledger().sequence();
+    client.revoke_certificate(&admin, &cert_id, &String::from_str(&env, "TEST"));
+
+    let cert = client.get_certificate(&admin, &cert_id);
+    let deadline = cert.revocation_deadline.unwrap();
+    assert_eq!(deadline, revoke_ledger + 17_280);
+
+    // Shrinking the period afterwards must not move the existing deadline.
+    client.update_revocation_challenge_period(&admin, &10u32);
+    assert_eq!(client.get_revocation_challenge_period(), 10);
+    assert_eq!(
+        client
+            .get_certificate(&admin, &cert_id)
+            .revocation_deadline,
+        Some(deadline)
+    );
+
+    // A challenge well past the new 10-ledger window but still inside the
+    // period active at revocation time succeeds.
+    env.ledger().with_mut(|l| {
+        l.sequence_number = revoke_ledger + 100;
+    });
+    client.challenge_revocation(&student, &cert_id);
+    assert!(!client.get_certificate(&admin, &cert_id).revoked);
+    assert!(client.verify_certificate(&cert_id));
+}
+
 // ============================================================
 // ENROLLMENT REJECTION EVENT TESTS
 // ============================================================
