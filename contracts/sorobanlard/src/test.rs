@@ -2275,6 +2275,49 @@ fn test_init_cannot_be_called_twice() {
     );
 }
 
+#[test]
+fn test_init_second_call_preserves_first_init_state() {
+    let (env, contract_id, _token_id, admin, sec_admin, treasury, _) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    // Snapshot state written by the first init call.
+    let fee_before = client.get_platform_fee(&admin);
+    let max_courses_before = client.get_max_courses_limit();
+    let refund_window_before = client.get_refund_window();
+    let challenge_period_before = client.get_revocation_challenge_period();
+
+    // A second init with different values must be rejected.
+    let other_admin = Address::generate(&env);
+    let other_sec_admin = Address::generate(&env);
+    let other_treasury = Address::generate(&env);
+    let result = client.try_init(
+        &other_admin,
+        &other_sec_admin,
+        &other_treasury,
+        &99u32,
+        &7u32,
+        &5u32,
+        &9u32,
+    );
+    assert!(result.is_err());
+
+    // State from the first init call is untouched.
+    assert_eq!(client.get_platform_fee(&admin), fee_before);
+    assert_eq!(client.get_max_courses_limit(), max_courses_before);
+    assert_eq!(client.get_refund_window(), refund_window_before);
+    assert_eq!(
+        client.get_revocation_challenge_period(),
+        challenge_period_before
+    );
+
+    // The original admin still holds privileges; the rejected admin does not.
+    client.update_default_fee(&admin, &25u32);
+    assert_eq!(client.get_platform_fee(&admin), 25);
+    assert!(client
+        .try_update_default_fee(&other_admin, &30u32)
+        .is_err());
+}
+
 // ============================================================
 // ISSUE #2: TOKEN WHITELIST
 // ============================================================
