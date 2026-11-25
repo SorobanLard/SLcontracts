@@ -1127,6 +1127,89 @@ fn test_mark_completed_succeeds_for_enrolled_student() {
 }
 
 #[test]
+#[should_panic(expected = "student has not completed this course")]
+fn test_issue_certificate_panics_before_mark_completed() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-NOT-COMPLETE-001",
+        500_000_000,
+    );
+
+    let course_id = String::from_str(&env, "COURSE-NOT-COMPLETE-001");
+    client.enroll(&student, &course_id);
+    assert_eq!(client.has_completed(&student, &course_id), Some(false));
+
+    client.issue_certificate(
+        &admin,
+        &student,
+        &course_id,
+        &String::from_str(&env, "CERT-NOT-COMPLETE-001"),
+        &String::from_str(&env, "Incomplete Course"),
+        &get_enrollment_ref(&env, &client, &student, "COURSE-NOT-COMPLETE-001"),
+        &None,
+        &None,
+    );
+}
+
+#[test]
+fn test_issue_certificate_succeeds_after_mark_completed() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-COMPLETE-001",
+        500_000_000,
+    );
+
+    let course_id = String::from_str(&env, "COURSE-COMPLETE-001");
+    let certificate_id = String::from_str(&env, "CERT-COMPLETE-001");
+    client.enroll(&student, &course_id);
+
+    client.mark_completed(
+        &admin,
+        &student,
+        &course_id,
+        &Some(String::from_str(&env, "evidence_hash")),
+    );
+    assert_eq!(client.has_completed(&student, &course_id), Some(true));
+
+    client.issue_certificate(
+        &admin,
+        &student,
+        &course_id,
+        &certificate_id,
+        &String::from_str(&env, "Completed Course"),
+        &get_enrollment_ref(&env, &client, &student, "COURSE-COMPLETE-001"),
+        &None,
+        &None,
+    );
+
+    assert!(client.verify_certificate(&certificate_id));
+    let cert = client.get_certificate(&student, &certificate_id);
+    assert_eq!(cert.student, student);
+    assert_eq!(cert.course_id, course_id);
+    assert!(!cert.revoked);
+}
+
+#[test]
 fn test_certificate_issued_event_contains_full_issuance_details() {
     let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
     let client = SorobanLardContractClient::new(&env, &contract_id);
