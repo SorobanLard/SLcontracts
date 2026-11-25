@@ -486,6 +486,11 @@ pub struct Enrollment {
     pub enrollment_ref: String,
     /// Ledger sequence when the enrollment was marked completed, if any (#166)
     pub completed_at_ledger: Option<u32>,
+    /// Refund window (in ledger sequences) that was active when this
+    /// enrollment was created. Refund eligibility is evaluated against this
+    /// value so later `update_refund_window` calls never retroactively change
+    /// the window of an existing enrollment.
+    pub refund_window_ledgers: u32,
 }
 
 /// An on-chain certificate of completion
@@ -3206,6 +3211,7 @@ impl SorobanLardContract {
             instructor_amount,
             enrollment_ref: new_enrollment_ref,
             completed_at_ledger: None,
+            refund_window_ledgers: Self::get_refund_window(env.clone()),
         };
 
         env.storage()

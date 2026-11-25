@@ -4694,6 +4694,117 @@ fn test_refund_request_outside_window_fails() {
 }
 
 #[test]
+fn test_update_refund_window_shorter_window_refund_within_succeeds() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-WINDOW-SHORT-IN",
+        1_000_000_000,
+    );
+
+    let course_id = String::from_str(&env, "COURSE-WINDOW-SHORT-IN");
+
+    // Start with a long window, then shorten it before enrolling.
+    client.update_refund_window(&admin, &100u32);
+    client.update_refund_window(&admin, &5u32);
+    assert_eq!(client.get_refund_window(), 5u32);
+
+    client.enroll(&student, &course_id);
+
+    // Advance to the last ledger still inside the new shorter window.
+    env.ledger().with_mut(|l| {
+        l.sequence_number += 4;
+    });
+
+    client.request_refund(&student, &course_id);
+    let request = client.get_refund_request(&student, &course_id).unwrap();
+    assert_eq!(request.status, RefundStatus::Pending);
+}
+
+#[test]
+#[should_panic(expected = "refund window has expired")]
+fn test_update_refund_window_shorter_window_refund_outside_panics() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-WINDOW-SHORT-OUT",
+        1_000_000_000,
+    );
+
+    let course_id = String::from_str(&env, "COURSE-WINDOW-SHORT-OUT");
+
+    client.update_refund_window(&admin, &100u32);
+    client.update_refund_window(&admin, &5u32);
+
+    client.enroll(&student, &course_id);
+
+    // 5 ledgers elapsed: still inside the old 100-ledger window, but outside
+    // the new 5-ledger window.
+    env.ledger().with_mut(|l| {
+        l.sequence_number += 5;
+    });
+
+    client.request_refund(&student, &course_id);
+}
+
+#[test]
+fn test_update_refund_window_preexisting_enrollment_keeps_enrollment_time_window() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-WINDOW-PREEXISTING",
+        1_000_000_000,
+    );
+
+    let course_id = String::from_str(&env, "COURSE-WINDOW-PREEXISTING");
+
+    // Long window active at enrollment time.
+    client.update_refund_window(&admin, &100u32);
+    client.enroll(&student, &course_id);
+
+    // Window is shortened after the enrollment already exists.
+    client.update_refund_window(&admin, &5u32);
+    assert_eq!(client.get_refund_window(), 5u32);
+
+    // 10 ledgers elapsed: outside the new window, but the enrollment keeps the
+    // window that was active when it was created.
+    env.ledger().with_mut(|l| {
+        l.sequence_number += 10;
+    });
+
+    client.request_refund(&student, &course_id);
+    let request = client.get_refund_request(&student, &course_id).unwrap();
+    assert_eq!(request.status, RefundStatus::Pending);
+}
+
+#[test]
 fn test_refund_rejection() {
     let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
     let client = SorobanLardContractClient::new(&env, &contract_id);
