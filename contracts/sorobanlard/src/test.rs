@@ -438,6 +438,86 @@ fn test_enroll_success_with_payment_split() {
 }
 
 #[test]
+fn test_total_earned_increments_per_enrollment() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let price: i128 = 1_000_000_000;
+    let course_id = String::from_str(&env, "COURSE-EARNED-001");
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-EARNED-001",
+        price,
+    );
+
+    let platform_share = price * 20 / 100;
+    let instructor_share = price - platform_share;
+
+    assert_eq!(client.get_course(&course_id).unwrap().total_earned, 0);
+
+    for expected_enrollments in 1..=3u32 {
+        let student = Address::generate(&env);
+        token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+        client.enroll(&student, &course_id);
+
+        let enrollment = client.get_enrollment(&student, &student, &course_id).unwrap();
+        assert_eq!(enrollment.instructor_amount, instructor_share);
+        assert_eq!(enrollment.platform_amount, platform_share);
+
+        let course = client.get_course(&course_id).unwrap();
+        assert_eq!(course.total_enrollments, expected_enrollments);
+        assert_eq!(
+            course.total_earned,
+            instructor_share * expected_enrollments as i128
+                + platform_share * expected_enrollments as i128,
+        );
+        assert_eq!(
+            client.get_instructor_earnings(&instructor, &token_id),
+            instructor_share * expected_enrollments as i128,
+        );
+    }
+}
+
+#[test]
+fn test_total_earned_unaffected_by_refund() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let price: i128 = 1_000_000_000;
+    let course_id = String::from_str(&env, "COURSE-EARNED-REFUND");
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-EARNED-REFUND",
+        price,
+    );
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+    client.enroll(&student, &course_id);
+
+    let earned_after_enroll = client.get_course(&course_id).unwrap().total_earned;
+    assert_eq!(earned_after_enroll, price);
+
+    client.request_refund(&student, &course_id);
+    client.process_refund(&admin, &student, &course_id, &true);
+
+    // total_earned is cumulative gross revenue: refunds debit the instructor
+    // earnings balance but never reduce Course.total_earned.
+    let course = client.get_course(&course_id).unwrap();
+    assert_eq!(course.total_earned, earned_after_enroll);
+    assert_eq!(course.active_enrollments, 0);
+    assert_eq!(client.get_instructor_earnings(&instructor, &token_id), 0);
+}
+
+#[test]
 #[should_panic(expected = "enrollment has not started for this course")]
 fn test_enroll_rejects_before_enrollment_start_ledger() {
     let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
