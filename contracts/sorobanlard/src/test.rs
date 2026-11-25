@@ -3412,6 +3412,106 @@ fn test_registration_limit_enforced() {
 }
 
 #[test]
+fn test_instructor_can_register_up_to_max_courses() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    client.update_max_courses_limit(&admin, &3u32);
+
+    for i in 0..3u32 {
+        let course_id = match i {
+            0 => String::from_str(&env, "COURSE-MAX-001"),
+            1 => String::from_str(&env, "COURSE-MAX-002"),
+            _ => String::from_str(&env, "COURSE-MAX-003"),
+        };
+        client.register_course(
+            &instructor,
+            &course_id,
+            &1_000_000i128,
+            &token_id,
+            &0u32,
+            &None,
+            &BytesN::from_array(&env, &[1u8; 32]),
+            &soroban_sdk::Vec::new(&env),
+        );
+        assert!(client.get_course(&course_id).is_some());
+    }
+}
+
+#[test]
+#[should_panic(expected = "instructor has reached the maximum number of course registrations")]
+fn test_registering_one_over_max_courses_panics() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    client.update_max_courses_limit(&admin, &2u32);
+
+    for i in 0..3u32 {
+        let course_id = match i {
+            0 => String::from_str(&env, "COURSE-OVER-001"),
+            1 => String::from_str(&env, "COURSE-OVER-002"),
+            _ => String::from_str(&env, "COURSE-OVER-003"),
+        };
+        client.register_course(
+            &instructor,
+            &course_id,
+            &1_000_000i128,
+            &token_id,
+            &0u32,
+            &None,
+            &BytesN::from_array(&env, &[1u8; 32]),
+            &soroban_sdk::Vec::new(&env),
+        );
+    }
+}
+
+#[test]
+fn test_course_limit_is_per_instructor() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    let other_instructor = Address::generate(&env);
+
+    client.update_max_courses_limit(&admin, &2u32);
+
+    for i in 0..2u32 {
+        let course_id = match i {
+            0 => String::from_str(&env, "COURSE-PER-A-001"),
+            _ => String::from_str(&env, "COURSE-PER-A-002"),
+        };
+        client.register_course(
+            &instructor,
+            &course_id,
+            &1_000_000i128,
+            &token_id,
+            &0u32,
+            &None,
+            &BytesN::from_array(&env, &[1u8; 32]),
+            &soroban_sdk::Vec::new(&env),
+        );
+    }
+
+    // The first instructor is at the limit, but a different instructor
+    // still has their own full allowance.
+    for i in 0..2u32 {
+        let course_id = match i {
+            0 => String::from_str(&env, "COURSE-PER-B-001"),
+            _ => String::from_str(&env, "COURSE-PER-B-002"),
+        };
+        client.register_course(
+            &other_instructor,
+            &course_id,
+            &1_000_000i128,
+            &token_id,
+            &0u32,
+            &None,
+            &BytesN::from_array(&env, &[1u8; 32]),
+            &soroban_sdk::Vec::new(&env),
+        );
+        assert!(client.get_course(&course_id).is_some());
+    }
+}
+
+#[test]
 fn test_admin_can_raise_limit() {
     let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
     let client = SorobanLardContractClient::new(&env, &contract_id);
