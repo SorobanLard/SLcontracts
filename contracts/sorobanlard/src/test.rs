@@ -4127,6 +4127,88 @@ fn test_archive_moves_record_and_get_course_returns_archive_during_cooldown() {
 }
 
 // ============================================================
+// ISSUE 354: ARCHIVED_AT_LEDGER TIMESTAMP
+// ============================================================
+
+#[test]
+fn test_archive_course_sets_archived_at_ledger_to_current_ledger() {
+    let (env, contract_id, token_id, admin, sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-ARCHIVE-LEDGER",
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-ARCHIVE-LEDGER");
+
+    client.pause_course(&admin, &course_id);
+
+    // Move to a distinct ledger so the archival timestamp is unambiguous.
+    let archive_ledger = env.ledger().sequence() + 42;
+    env.ledger().with_mut(|l| {
+        l.sequence_number = archive_ledger;
+    });
+
+    client.archive_course(&admin, &sec_admin, &course_id, &None);
+
+    let stored: Course = env.as_contract(&contract_id, || {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ArchivedCourse(course_id.clone()))
+            .unwrap()
+    });
+    assert_eq!(stored.status, CourseStatus::Archived);
+    assert_eq!(stored.archived_at_ledger, Some(archive_ledger));
+    assert_eq!(stored.last_updated_ledger, archive_ledger);
+}
+
+#[test]
+fn test_get_course_returns_archived_at_ledger() {
+    let (env, contract_id, token_id, admin, sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-ARCHIVE-GET-LEDGER",
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-ARCHIVE-GET-LEDGER");
+
+    // Before archival the field is unset.
+    let active = client.get_course(&course_id).unwrap();
+    assert_eq!(active.archived_at_ledger, None);
+
+    client.pause_course(&admin, &course_id);
+
+    let archive_ledger = env.ledger().sequence() + 7;
+    env.ledger().with_mut(|l| {
+        l.sequence_number = archive_ledger;
+    });
+
+    client.archive_course(&admin, &sec_admin, &course_id, &None);
+
+    let archived = client.get_course(&course_id).unwrap();
+    assert_eq!(archived.status, CourseStatus::Archived);
+    assert_eq!(archived.archived_at_ledger, Some(archive_ledger));
+
+    // The value is stable across later ledgers.
+    env.ledger().with_mut(|l| {
+        l.sequence_number = archive_ledger + 10;
+    });
+    let later = client.get_course(&course_id).unwrap();
+    assert_eq!(later.archived_at_ledger, Some(archive_ledger));
+}
+
+// ============================================================
 // ISSUE 48: CONCURRENT ENROLLMENT/COMPLETION
 // ============================================================
 
