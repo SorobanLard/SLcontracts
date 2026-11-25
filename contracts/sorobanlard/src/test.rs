@@ -13659,6 +13659,61 @@ fn test_issue248_categories_too_many() {
 }
 
 #[test]
+fn test_issue367_get_course_returns_registered_categories() {
+    let (env, contract_id, token_id, instructor, _sec_admin, _treasury, _admin) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let mut cats = soroban_sdk::Vec::new(&env);
+    cats.push_back(String::from_str(&env, "programming"));
+    cats.push_back(String::from_str(&env, "blockchain"));
+
+    let course_id = String::from_str(&env, "CAT367");
+    client.register_course(
+        &instructor,
+        &course_id,
+        &100_000_000,
+        &token_id,
+        &0u32,
+        &None,
+        &BytesN::from_array(&env, &[37u8; 32]),
+        &cats,
+    );
+
+    let course = client.get_course(&course_id).unwrap();
+    assert_eq!(course.categories.len(), 2);
+    assert_eq!(
+        course.categories.get(0).unwrap(),
+        String::from_str(&env, "programming")
+    );
+    assert_eq!(
+        course.categories.get(1).unwrap(),
+        String::from_str(&env, "blockchain")
+    );
+}
+
+#[test]
+fn test_issue367_get_course_empty_categories() {
+    let (env, contract_id, token_id, instructor, _sec_admin, _treasury, _admin) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let cats = soroban_sdk::Vec::new(&env);
+    let course_id = String::from_str(&env, "CAT367EMPTY");
+    client.register_course(
+        &instructor,
+        &course_id,
+        &100_000_000,
+        &token_id,
+        &0u32,
+        &None,
+        &BytesN::from_array(&env, &[38u8; 32]),
+        &cats,
+    );
+
+    let course = client.get_course(&course_id).unwrap();
+    assert_eq!(course.categories.len(), 0);
+}
+
+#[test]
 #[should_panic(expected = "register_course: category name too long")]
 fn test_issue248_category_too_long() {
     let (env, contract_id, token_id, instructor, _sec_admin, _treasury, _admin) = setup();
