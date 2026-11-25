@@ -8343,6 +8343,77 @@ fn test_propose_upgrade_authorized() {
 }
 
 #[test]
+fn test_propose_upgrade_effective_ledger_uses_min_timelock() {
+    let (env, contract_id, _token_id, admin, sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let current_ledger = env.ledger().sequence();
+    let wasm_hash = BytesN::from_array(&env, &[7u8; 32]);
+    client.propose_upgrade(&admin, &sec_admin, &wasm_hash);
+
+    let pending = client.get_pending_upgrade().unwrap();
+    assert_eq!(pending.proposed_at_ledger, current_ledger);
+    assert_eq!(
+        pending.effective_ledger,
+        current_ledger + SorobanLardContract::MIN_UPGRADE_TIMELOCK_LEDGERS
+    );
+}
+
+#[test]
+#[should_panic(expected = "upgrade time-lock has not elapsed")]
+fn test_upgrade_contract_one_ledger_before_effective_ledger_fails() {
+    let (env, contract_id, _token_id, admin, sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let wasm_hash = BytesN::from_array(&env, &[7u8; 32]);
+    client.propose_upgrade(&admin, &sec_admin, &wasm_hash);
+
+    let effective_ledger = client.get_pending_upgrade().unwrap().effective_ledger;
+    env.ledger().with_mut(|l| {
+        l.sequence_number = effective_ledger - 1;
+    });
+
+    client.upgrade_contract(&admin, &sec_admin);
+}
+
+#[test]
+#[should_panic]
+fn test_upgrade_contract_at_effective_ledger_passes_timelock() {
+    // At exactly `effective_ledger` the time-lock gate opens; the call then
+    // reaches the host's Wasm-swap, which panics only because the hash was
+    // never uploaded in native unit tests.
+    let (env, contract_id, _token_id, admin, sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let wasm_hash = BytesN::from_array(&env, &[7u8; 32]);
+    client.propose_upgrade(&admin, &sec_admin, &wasm_hash);
+
+    let effective_ledger = client.get_pending_upgrade().unwrap().effective_ledger;
+    env.ledger().with_mut(|l| {
+        l.sequence_number = effective_ledger;
+    });
+
+    client.upgrade_contract(&admin, &sec_admin);
+}
+
+#[test]
+#[should_panic]
+fn test_upgrade_contract_after_effective_ledger_passes_timelock() {
+    let (env, contract_id, _token_id, admin, sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let wasm_hash = BytesN::from_array(&env, &[7u8; 32]);
+    client.propose_upgrade(&admin, &sec_admin, &wasm_hash);
+
+    let effective_ledger = client.get_pending_upgrade().unwrap().effective_ledger;
+    env.ledger().with_mut(|l| {
+        l.sequence_number = effective_ledger + 1;
+    });
+
+    client.upgrade_contract(&admin, &sec_admin);
+}
+
+#[test]
 #[should_panic(expected = "unauthorized: requires both admin signatures")]
 fn test_propose_upgrade_unauthorized() {
     let (env, contract_id, _token_id, admin, _sec_admin, _treasury, _instructor) = setup();
