@@ -12830,6 +12830,119 @@ fn test_enroll_rolls_back_when_second_split_transfer_fails() {
 }
 
 // ============================================================
+// INSTRUCTOR PAYMENT WITHOUT ESCROW  (#368)
+// ============================================================
+
+/// #368 — the instructor's share is credited inside the same `enroll`
+/// invocation that takes the student's payment: no separate escrow contract
+/// or intermediate holding step exists between payment and instructor receipt.
+#[test]
+fn test_instructor_payment_credited_in_same_enroll_transaction() {
+    let (env, contract_id, token_id, admin, _sec_admin, treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+
+    let student = Address::generate(&env);
+    let funded = 1_000_000_000i128;
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &funded);
+
+    let price = 100_000_000i128;
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-NO-ESCROW",
+        price,
+    );
+    let course_id = String::from_str(&env, "COURSE-NO-ESCROW");
+
+    let platform_amount = price * 20 / 100;
+    let instructor_amount = price - platform_amount;
+
+    // Single enroll invocation: student pays, instructor share is credited.
+    client.enroll(&student, &course_id);
+
+    let enrollment = client
+        .get_enrollment(&student, &student, &course_id)
+        .expect("enrollment must exist");
+    assert_eq!(enrollment.instructor_amount, instructor_amount);
+    assert_eq!(enrollment.platform_amount, platform_amount);
+
+    // Instructor balance increases by instructor_amount in the same transaction.
+    assert_eq!(
+        client.get_instructor_earnings(&instructor, &token_id),
+        instructor_amount
+    );
+    assert_eq!(
+        client.get_instructor_total_earnings(&instructor),
+        instructor_amount
+    );
+
+    // No escrow: the only holder of the instructor share is this contract's
+    // own earnings ledger, and the treasury got exactly the platform share.
+    assert_eq!(token_client.balance(&student), funded - price);
+    assert_eq!(token_client.balance(&treasury), platform_amount);
+    assert_eq!(token_client.balance(&contract_id), instructor_amount);
+
+    // The instructor can withdraw the full share immediately afterwards.
+    client.withdraw_earnings(&instructor, &token_id, &instructor_amount);
+    assert_eq!(token_client.balance(&instructor), instructor_amount);
+    assert_eq!(token_client.balance(&contract_id), 0);
+    assert_eq!(client.get_instructor_earnings(&instructor, &token_id), 0);
+}
+
+/// #368 — no intermediate escrow contract is involved: the only addresses
+/// whose balances change during `enroll` are the student, the treasury, the
+/// course contract itself and the instructor (on withdrawal).
+#[test]
+fn test_enroll_has_no_intermediate_escrow_holder() {
+    let (env, contract_id, token_id, admin, _sec_admin, treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+
+    let student = Address::generate(&env);
+    let funded = 1_000_000_000i128;
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &funded);
+
+    let price = 100_000_000i128;
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-NO-ESCROW-2",
+        price,
+    );
+    let course_id = String::from_str(&env, "COURSE-NO-ESCROW-2");
+
+    let platform_amount = price * 20 / 100;
+    let instructor_amount = price - platform_amount;
+
+    client.enroll(&student, &course_id);
+
+    // Funds are fully accounted for by the student, treasury and the course
+    // contract's earnings ledger — nothing is parked in a third party.
+    assert_eq!(
+        token_client.balance(&student) + token_client.balance(&treasury)
+            + token_client.balance(&contract_id),
+        funded
+    );
+    assert_eq!(token_client.balance(&contract_id), instructor_amount);
+    assert_eq!(
+        client.get_instructor_earnings(&instructor, &token_id),
+        token_client.balance(&contract_id)
+    );
+
+    // The instructor is paid out of the course contract directly.
+    client.withdraw_earnings(&instructor, &token_id, &0i128);
+    assert_eq!(token_client.balance(&instructor), instructor_amount);
+    assert_eq!(token_client.balance(&contract_id), 0);
+}
+
+// ============================================================
 // TOKEN ASSUMPTIONS & EARNINGS RECONCILIATION  (#138)
 // ============================================================
 
