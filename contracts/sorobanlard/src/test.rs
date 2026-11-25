@@ -1566,6 +1566,67 @@ fn test_pause_and_unpause_course() {
     assert_eq!(course.status, CourseStatus::Active);
 }
 
+/// Enrolling in a Paused course must panic.
+#[test]
+#[should_panic(expected = "course is not available for enrollment")]
+fn test_enroll_paused_course_panics() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    let course_id = String::from_str(&env, "COURSE-PAUSED-ENROLL");
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-PAUSED-ENROLL",
+        100_000_000,
+    );
+
+    client.pause_course(&instructor, &course_id);
+    assert_eq!(
+        client.get_course(&course_id).unwrap().status,
+        CourseStatus::Paused
+    );
+
+    client.enroll(&student, &course_id);
+}
+
+/// unpause_course restores enrollment acceptance.
+#[test]
+fn test_unpause_course_restores_enrollment() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    let course_id = String::from_str(&env, "COURSE-UNPAUSE-ENROLL");
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-UNPAUSE-ENROLL",
+        100_000_000,
+    );
+
+    client.pause_course(&instructor, &course_id);
+    client.unpause_course(&admin, &course_id);
+    assert_eq!(
+        client.get_course(&course_id).unwrap().status,
+        CourseStatus::Active
+    );
+
+    client.enroll(&student, &course_id);
+    assert!(client
+        .get_enrollment(&student, &student, &course_id)
+        .is_some());
+}
+
 /// Double-pause must be rejected (Active-status precondition)
 #[test]
 #[should_panic(expected = "course is not active")]
