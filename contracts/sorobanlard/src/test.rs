@@ -998,6 +998,82 @@ fn test_is_enrolled_check() {
     assert!(client.is_enrolled(&student, &course_id));
 }
 
+#[test]
+fn test_is_enrolled_true_after_enroll() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-ISENR-001",
+        300_000_000,
+    );
+
+    let course_id = String::from_str(&env, "COURSE-ISENR-001");
+    client.enroll(&student, &course_id);
+    assert!(client.is_enrolled(&student, &course_id));
+}
+
+#[test]
+fn test_is_enrolled_false_for_never_enrolled() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-ISENR-002",
+        300_000_000,
+    );
+
+    let course_id = String::from_str(&env, "COURSE-ISENR-002");
+    assert!(!client.is_enrolled(&student, &course_id));
+}
+
+#[test]
+fn test_is_enrolled_false_after_refund() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-ISENR-003",
+        300_000_000,
+    );
+
+    let course_id = String::from_str(&env, "COURSE-ISENR-003");
+    client.update_refund_window(&admin, &10u32);
+
+    client.enroll(&student, &course_id);
+    assert!(client.is_enrolled(&student, &course_id));
+
+    client.request_refund(&student, &course_id);
+    env.mock_all_auths_allowing_non_root_auth();
+    client.process_refund(&admin, &student, &course_id, &true);
+
+    assert!(!client.is_enrolled(&student, &course_id));
+}
+
 // ============================================================
 // COMPLETION & CERTIFICATE TESTS
 // ============================================================
@@ -1749,6 +1825,59 @@ fn test_mark_completed_rejects_mismatched_enrollment_course_id() {
         &course_id,
         &Some(String::from_str(&env, "proof")),
     );
+}
+
+#[test]
+fn test_has_completed_false_for_enrolled_not_completed_student() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &1_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-HASCOMPLETE-1",
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-HASCOMPLETE-1");
+
+    client.enroll(&student, &course_id);
+    assert!(client.is_enrolled(&student, &course_id));
+    assert_eq!(client.has_completed(&student, &course_id), Some(false));
+}
+
+#[test]
+fn test_has_completed_true_after_mark_completed() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &1_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-HASCOMPLETE-2",
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-HASCOMPLETE-2");
+
+    client.enroll(&student, &course_id);
+    assert_eq!(client.has_completed(&student, &course_id), Some(false));
+
+    client.mark_completed(
+        &admin,
+        &student,
+        &course_id,
+        &Some(String::from_str(&env, "evidence_hash")),
+    );
+    assert_eq!(client.has_completed(&student, &course_id), Some(true));
 }
 
 #[test]
