@@ -1067,6 +1067,66 @@ fn test_full_lifecycle_enroll_complete_certify() {
 }
 
 #[test]
+#[should_panic(expected = "enrollment not found")]
+fn test_mark_completed_panics_for_non_enrolled_student() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-NO-ENROLL-001",
+        500_000_000,
+    );
+
+    let course_id = String::from_str(&env, "COURSE-NO-ENROLL-001");
+    assert!(!client.is_enrolled(&student, &course_id));
+
+    client.mark_completed(
+        &admin,
+        &student,
+        &course_id,
+        &Some(String::from_str(&env, "evidence_hash")),
+    );
+}
+
+#[test]
+fn test_mark_completed_succeeds_for_enrolled_student() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-ENROLL-001",
+        500_000_000,
+    );
+
+    let course_id = String::from_str(&env, "COURSE-ENROLL-001");
+    client.enroll(&student, &course_id);
+    assert_eq!(client.has_completed(&student, &course_id), Some(false));
+
+    client.mark_completed(
+        &admin,
+        &student,
+        &course_id,
+        &Some(String::from_str(&env, "evidence_hash")),
+    );
+    assert_eq!(client.has_completed(&student, &course_id), Some(true));
+}
+
+#[test]
 fn test_certificate_issued_event_contains_full_issuance_details() {
     let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
     let client = SorobanLardContractClient::new(&env, &contract_id);
