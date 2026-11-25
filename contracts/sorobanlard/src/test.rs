@@ -116,6 +116,23 @@ fn test_init_success() {
 }
 
 #[test]
+fn test_get_platform_fee_admin_can_read() {
+    let (env, contract_id, _token_id, admin, _sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    assert_eq!(client.get_platform_fee(&admin), 20);
+}
+
+#[test]
+#[should_panic(expected = "unauthorized: get_platform_fee - caller is not admin")]
+fn test_get_platform_fee_non_admin_rejected() {
+    let (env, contract_id, _token_id, _admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    client.get_platform_fee(&instructor);
+}
+
+#[test]
 fn test_admin_instance_ttl_extended_on_admin_ops() {
     let (env, contract_id, token_id, admin, sec_admin, treasury, instructor) = setup();
     let client = SorobanLardContractClient::new(&env, &contract_id);
@@ -4127,6 +4144,88 @@ fn test_archive_moves_record_and_get_course_returns_archive_during_cooldown() {
 }
 
 // ============================================================
+// ISSUE 354: ARCHIVED_AT_LEDGER TIMESTAMP
+// ============================================================
+
+#[test]
+fn test_archive_course_sets_archived_at_ledger_to_current_ledger() {
+    let (env, contract_id, token_id, admin, sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-ARCHIVE-LEDGER",
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-ARCHIVE-LEDGER");
+
+    client.pause_course(&admin, &course_id);
+
+    // Move to a distinct ledger so the archival timestamp is unambiguous.
+    let archive_ledger = env.ledger().sequence() + 42;
+    env.ledger().with_mut(|l| {
+        l.sequence_number = archive_ledger;
+    });
+
+    client.archive_course(&admin, &sec_admin, &course_id, &None);
+
+    let stored: Course = env.as_contract(&contract_id, || {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ArchivedCourse(course_id.clone()))
+            .unwrap()
+    });
+    assert_eq!(stored.status, CourseStatus::Archived);
+    assert_eq!(stored.archived_at_ledger, Some(archive_ledger));
+    assert_eq!(stored.last_updated_ledger, archive_ledger);
+}
+
+#[test]
+fn test_get_course_returns_archived_at_ledger() {
+    let (env, contract_id, token_id, admin, sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-ARCHIVE-GET-LEDGER",
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-ARCHIVE-GET-LEDGER");
+
+    // Before archival the field is unset.
+    let active = client.get_course(&course_id).unwrap();
+    assert_eq!(active.archived_at_ledger, None);
+
+    client.pause_course(&admin, &course_id);
+
+    let archive_ledger = env.ledger().sequence() + 7;
+    env.ledger().with_mut(|l| {
+        l.sequence_number = archive_ledger;
+    });
+
+    client.archive_course(&admin, &sec_admin, &course_id, &None);
+
+    let archived = client.get_course(&course_id).unwrap();
+    assert_eq!(archived.status, CourseStatus::Archived);
+    assert_eq!(archived.archived_at_ledger, Some(archive_ledger));
+
+    // The value is stable across later ledgers.
+    env.ledger().with_mut(|l| {
+        l.sequence_number = archive_ledger + 10;
+    });
+    let later = client.get_course(&course_id).unwrap();
+    assert_eq!(later.archived_at_ledger, Some(archive_ledger));
+}
+
+// ============================================================
 // ISSUE 48: CONCURRENT ENROLLMENT/COMPLETION
 // ============================================================
 
@@ -4609,6 +4708,117 @@ fn test_refund_request_outside_window_fails() {
     });
 
     client.request_refund(&student, &course_id);
+}
+
+#[test]
+fn test_update_refund_window_shorter_window_refund_within_succeeds() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-WINDOW-SHORT-IN",
+        1_000_000_000,
+    );
+
+    let course_id = String::from_str(&env, "COURSE-WINDOW-SHORT-IN");
+
+    // Start with a long window, then shorten it before enrolling.
+    client.update_refund_window(&admin, &100u32);
+    client.update_refund_window(&admin, &5u32);
+    assert_eq!(client.get_refund_window(), 5u32);
+
+    client.enroll(&student, &course_id);
+
+    // Advance to the last ledger still inside the new shorter window.
+    env.ledger().with_mut(|l| {
+        l.sequence_number += 4;
+    });
+
+    client.request_refund(&student, &course_id);
+    let request = client.get_refund_request(&student, &course_id).unwrap();
+    assert_eq!(request.status, RefundStatus::Pending);
+}
+
+#[test]
+#[should_panic(expected = "refund window has expired")]
+fn test_update_refund_window_shorter_window_refund_outside_panics() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-WINDOW-SHORT-OUT",
+        1_000_000_000,
+    );
+
+    let course_id = String::from_str(&env, "COURSE-WINDOW-SHORT-OUT");
+
+    client.update_refund_window(&admin, &100u32);
+    client.update_refund_window(&admin, &5u32);
+
+    client.enroll(&student, &course_id);
+
+    // 5 ledgers elapsed: still inside the old 100-ledger window, but outside
+    // the new 5-ledger window.
+    env.ledger().with_mut(|l| {
+        l.sequence_number += 5;
+    });
+
+    client.request_refund(&student, &course_id);
+}
+
+#[test]
+fn test_update_refund_window_preexisting_enrollment_keeps_enrollment_time_window() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-WINDOW-PREEXISTING",
+        1_000_000_000,
+    );
+
+    let course_id = String::from_str(&env, "COURSE-WINDOW-PREEXISTING");
+
+    // Long window active at enrollment time.
+    client.update_refund_window(&admin, &100u32);
+    client.enroll(&student, &course_id);
+
+    // Window is shortened after the enrollment already exists.
+    client.update_refund_window(&admin, &5u32);
+    assert_eq!(client.get_refund_window(), 5u32);
+
+    // 10 ledgers elapsed: outside the new window, but the enrollment keeps the
+    // window that was active when it was created.
+    env.ledger().with_mut(|l| {
+        l.sequence_number += 10;
+    });
+
+    client.request_refund(&student, &course_id);
+    let request = client.get_refund_request(&student, &course_id).unwrap();
+    assert_eq!(request.status, RefundStatus::Pending);
 }
 
 #[test]
@@ -8258,6 +8468,77 @@ fn test_propose_upgrade_authorized() {
         pending.effective_ledger,
         pending.proposed_at_ledger + client.get_upgrade_timelock()
     );
+}
+
+#[test]
+fn test_propose_upgrade_effective_ledger_uses_min_timelock() {
+    let (env, contract_id, _token_id, admin, sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let current_ledger = env.ledger().sequence();
+    let wasm_hash = BytesN::from_array(&env, &[7u8; 32]);
+    client.propose_upgrade(&admin, &sec_admin, &wasm_hash);
+
+    let pending = client.get_pending_upgrade().unwrap();
+    assert_eq!(pending.proposed_at_ledger, current_ledger);
+    assert_eq!(
+        pending.effective_ledger,
+        current_ledger + SorobanLardContract::MIN_UPGRADE_TIMELOCK_LEDGERS
+    );
+}
+
+#[test]
+#[should_panic(expected = "upgrade time-lock has not elapsed")]
+fn test_upgrade_contract_one_ledger_before_effective_ledger_fails() {
+    let (env, contract_id, _token_id, admin, sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let wasm_hash = BytesN::from_array(&env, &[7u8; 32]);
+    client.propose_upgrade(&admin, &sec_admin, &wasm_hash);
+
+    let effective_ledger = client.get_pending_upgrade().unwrap().effective_ledger;
+    env.ledger().with_mut(|l| {
+        l.sequence_number = effective_ledger - 1;
+    });
+
+    client.upgrade_contract(&admin, &sec_admin);
+}
+
+#[test]
+#[should_panic]
+fn test_upgrade_contract_at_effective_ledger_passes_timelock() {
+    // At exactly `effective_ledger` the time-lock gate opens; the call then
+    // reaches the host's Wasm-swap, which panics only because the hash was
+    // never uploaded in native unit tests.
+    let (env, contract_id, _token_id, admin, sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let wasm_hash = BytesN::from_array(&env, &[7u8; 32]);
+    client.propose_upgrade(&admin, &sec_admin, &wasm_hash);
+
+    let effective_ledger = client.get_pending_upgrade().unwrap().effective_ledger;
+    env.ledger().with_mut(|l| {
+        l.sequence_number = effective_ledger;
+    });
+
+    client.upgrade_contract(&admin, &sec_admin);
+}
+
+#[test]
+#[should_panic]
+fn test_upgrade_contract_after_effective_ledger_passes_timelock() {
+    let (env, contract_id, _token_id, admin, sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let wasm_hash = BytesN::from_array(&env, &[7u8; 32]);
+    client.propose_upgrade(&admin, &sec_admin, &wasm_hash);
+
+    let effective_ledger = client.get_pending_upgrade().unwrap().effective_ledger;
+    env.ledger().with_mut(|l| {
+        l.sequence_number = effective_ledger + 1;
+    });
+
+    client.upgrade_contract(&admin, &sec_admin);
 }
 
 #[test]
