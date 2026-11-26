@@ -14641,3 +14641,6 @@ fn test_course_certificates_index_grows_per_issuance() {
     assert_eq!(final_index.len(), 3);
     assert_eq!(final_index.get(2).unwrap(), String::from_str(&env, "CERT-IDX-320-C"));
 }
+
+mod issues_346;
+mod issues_349;
