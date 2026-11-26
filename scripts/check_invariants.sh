@@ -2,13 +2,16 @@
 # Compare the invariants documented in INVARIANTS.md against the
 # `test_invariant_invNN_*` tests in the contract test suite.
 #
+# INVARIANTS_DOC and INVARIANTS_TESTS override the two input files (used by
+# scripts/tests/test_check_invariants.py).
+#
 # Prints a summary (also appended to $GITHUB_STEP_SUMMARY when run in
 # GitHub Actions) and exits non-zero if any documented invariant has no test.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-DOC="$ROOT/INVARIANTS.md"
-TESTS="$ROOT/contracts/sorobanlard/src/test.rs"
+DOC="${INVARIANTS_DOC:-$ROOT/INVARIANTS.md}"
+TESTS="${INVARIANTS_TESTS:-$ROOT/contracts/sorobanlard/src/test.rs}"
 
 documented=$( (grep -oE '^### INV-[0-9]+' "$DOC" || true) | grep -oE '[0-9]+' | sort -u || true)
 tested=$( (grep -oE 'fn test_invariant_inv[0-9]+_' "$TESTS" || true) | grep -oE '[0-9]+' | sort -u || true)
