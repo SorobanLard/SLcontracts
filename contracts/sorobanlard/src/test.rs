@@ -116,6 +116,54 @@ fn test_init_success() {
 }
 
 #[test]
+#[should_panic(expected = "admin and treasury must be distinct addresses")]
+fn test_init_panics_when_admin_equals_treasury() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(SorobanLardContract, ());
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let sec_admin = Address::generate(&env);
+
+    client.init(
+        &admin, &sec_admin, &admin, &20u32, &50u32, &1000u32, &17_280u32,
+    );
+}
+
+#[test]
+#[should_panic(expected = "admin and secondary_admin must be distinct addresses")]
+fn test_init_panics_when_admin_equals_secondary_admin() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(SorobanLardContract, ());
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+
+    client.init(
+        &admin, &admin, &treasury, &20u32, &50u32, &1000u32, &17_280u32,
+    );
+}
+
+#[test]
+#[should_panic(expected = "secondary_admin and treasury must be distinct addresses")]
+fn test_init_panics_when_secondary_admin_equals_treasury() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(SorobanLardContract, ());
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let sec_admin = Address::generate(&env);
+
+    client.init(
+        &admin, &sec_admin, &sec_admin, &20u32, &50u32, &1000u32, &17_280u32,
+    );
+}
+
+#[test]
 fn test_admin_instance_ttl_extended_on_admin_ops() {
     let (env, contract_id, token_id, admin, sec_admin, treasury, instructor) = setup();
     let client = SorobanLardContractClient::new(&env, &contract_id);
