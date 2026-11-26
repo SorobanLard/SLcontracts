@@ -7731,6 +7731,48 @@ fn test_register_course_distinct_hashes_stored_independently() {
 }
 
 #[test]
+fn test_get_course_returns_content_hash_after_approval() {
+    // The hash must survive the pending -> active transition and be
+    // retrievable via get_course for an approved course.
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let hash = BytesN::from_array(&env, &[0x5Au8; 32]);
+    let course_id = String::from_str(&env, "COURSE-HASH-APPROVED");
+
+    client.register_course(
+        &instructor,
+        &course_id,
+        &100_000_000,
+        &token_id,
+        &0u32,
+        &None,
+        &hash,
+        &soroban_sdk::Vec::new(&env),
+    );
+
+    let pending = client.get_course(&course_id).unwrap();
+    assert_eq!(pending.content_hash, hash);
+
+    client.approve_course(&admin, &course_id);
+
+    let active = client.get_course(&course_id).unwrap();
+    assert_eq!(active.content_hash, hash);
+    assert_eq!(active.status, CourseStatus::Active);
+}
+
+#[test]
+fn test_get_course_returns_none_for_unknown_course_hash() {
+    // A course that was never registered must not surface a content_hash.
+    let (env, contract_id, _token_id, _admin, _sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    assert!(client
+        .get_course(&String::from_str(&env, "COURSE-HASH-MISSING"))
+        .is_none());
+}
+
+#[test]
 fn test_instructor_can_update_content_hash_on_active_course() {
     let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
     let client = SorobanLardContractClient::new(&env, &contract_id);
@@ -12718,6 +12760,103 @@ fn test_resolve_arbitration_requires_secondary_admin_cosignature() {
 }
 
 // ============================================================
+// PAYMENT SPLIT LOSSLESSNESS TESTS (#369)
+// ============================================================
+
+/// Enrolls a student in a course priced at `price` with the given per-token
+/// fee in basis points and returns the recorded enrollment.
+fn enroll_and_get_split(
+    env: &Env,
+    client: &SorobanLardContractClient,
+    token_id: &Address,
+    admin: &Address,
+    instructor: &Address,
+    course_id: &str,
+    price: i128,
+    fee_bps: u32,
+) -> Enrollment {
+    client.set_fee_config(admin, token_id, &fee_bps);
+    register_and_approve_course(env, client, token_id, admin, instructor, course_id, price);
+
+    let student = Address::generate(env);
+    token::StellarAssetClient::new(env, token_id).mint(&student, &price);
+    client.enroll(&student, &String::from_str(env, course_id));
+
+    client
+        .get_enrollment(&student, &student, &String::from_str(env, course_id))
+        .expect("enrollment must exist")
+}
+
+/// The split recorded on the enrollment is lossless for integer prices:
+/// `platform_amount + instructor_amount == price`.
+#[test]
+fn test_payment_split_is_lossless_for_integer_prices() {
+    let (env, contract_id, token_id, admin, _sec_admin, treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    for (i, price) in [1i128, 7, 99, 100, 101, 999, 1_000, 12_345, 500_000_000].iter() {
+        let course_id = format!("SPLIT-INT-{}", i);
+        let enrollment = enroll_and_get_split(
+            &env,
+            &client,
+            &token_id,
+            &admin,
+            &instructor,
+            &course_id,
+            *price,
+            2_000,
+        );
+
+        assert_eq!(enrollment.amount_paid, *price);
+        assert_eq!(
+            enrollment.platform_amount + enrollment.instructor_amount,
+            *price,
+            "split must be lossless for price {}",
+            price
+        );
+        assert!(enrollment.platform_amount >= 0);
+        assert!(enrollment.instructor_amount >= 0);
+        assert_eq!(
+            token::Client::new(&env, &token_id).balance(&treasury),
+            enrollment.platform_amount
+        );
+    }
+}
+
+/// Prices that are not evenly divisible by 100 lose no stroop: the integer
+/// division remainder stays with the instructor share.
+#[test]
+fn test_payment_split_loses_no_stroop_when_price_not_divisible_by_100() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    // 20% platform fee: 1_001 * 2000 / 10000 = 200 (remainder 200 stroops).
+    let price = 1_001i128;
+    let enrollment = enroll_and_get_split(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "SPLIT-ODD",
+        price,
+        2_000,
+    );
+
+    assert_eq!(enrollment.platform_amount, 200);
+    assert_eq!(enrollment.instructor_amount, 801);
+    assert_eq!(
+        enrollment.platform_amount + enrollment.instructor_amount,
+        price,
+        "no stroop may be lost on a non-divisible price"
+    );
+    assert_eq!(
+        client.get_instructor_earnings(&instructor, &token_id),
+        enrollment.instructor_amount
+    );
+}
+
+// ============================================================
 // FULL-LIFECYCLE DISPUTE INTEGRATION TESTS
 // ============================================================
 
@@ -13703,6 +13842,119 @@ fn test_enroll_rolls_back_when_second_split_transfer_fails() {
 }
 
 // ============================================================
+// INSTRUCTOR PAYMENT WITHOUT ESCROW  (#368)
+// ============================================================
+
+/// #368 — the instructor's share is credited inside the same `enroll`
+/// invocation that takes the student's payment: no separate escrow contract
+/// or intermediate holding step exists between payment and instructor receipt.
+#[test]
+fn test_instructor_payment_credited_in_same_enroll_transaction() {
+    let (env, contract_id, token_id, admin, _sec_admin, treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+
+    let student = Address::generate(&env);
+    let funded = 1_000_000_000i128;
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &funded);
+
+    let price = 100_000_000i128;
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-NO-ESCROW",
+        price,
+    );
+    let course_id = String::from_str(&env, "COURSE-NO-ESCROW");
+
+    let platform_amount = price * 20 / 100;
+    let instructor_amount = price - platform_amount;
+
+    // Single enroll invocation: student pays, instructor share is credited.
+    client.enroll(&student, &course_id);
+
+    let enrollment = client
+        .get_enrollment(&student, &student, &course_id)
+        .expect("enrollment must exist");
+    assert_eq!(enrollment.instructor_amount, instructor_amount);
+    assert_eq!(enrollment.platform_amount, platform_amount);
+
+    // Instructor balance increases by instructor_amount in the same transaction.
+    assert_eq!(
+        client.get_instructor_earnings(&instructor, &token_id),
+        instructor_amount
+    );
+    assert_eq!(
+        client.get_instructor_total_earnings(&instructor),
+        instructor_amount
+    );
+
+    // No escrow: the only holder of the instructor share is this contract's
+    // own earnings ledger, and the treasury got exactly the platform share.
+    assert_eq!(token_client.balance(&student), funded - price);
+    assert_eq!(token_client.balance(&treasury), platform_amount);
+    assert_eq!(token_client.balance(&contract_id), instructor_amount);
+
+    // The instructor can withdraw the full share immediately afterwards.
+    client.withdraw_earnings(&instructor, &token_id, &instructor_amount);
+    assert_eq!(token_client.balance(&instructor), instructor_amount);
+    assert_eq!(token_client.balance(&contract_id), 0);
+    assert_eq!(client.get_instructor_earnings(&instructor, &token_id), 0);
+}
+
+/// #368 — no intermediate escrow contract is involved: the only addresses
+/// whose balances change during `enroll` are the student, the treasury, the
+/// course contract itself and the instructor (on withdrawal).
+#[test]
+fn test_enroll_has_no_intermediate_escrow_holder() {
+    let (env, contract_id, token_id, admin, _sec_admin, treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+
+    let student = Address::generate(&env);
+    let funded = 1_000_000_000i128;
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &funded);
+
+    let price = 100_000_000i128;
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-NO-ESCROW-2",
+        price,
+    );
+    let course_id = String::from_str(&env, "COURSE-NO-ESCROW-2");
+
+    let platform_amount = price * 20 / 100;
+    let instructor_amount = price - platform_amount;
+
+    client.enroll(&student, &course_id);
+
+    // Funds are fully accounted for by the student, treasury and the course
+    // contract's earnings ledger — nothing is parked in a third party.
+    assert_eq!(
+        token_client.balance(&student) + token_client.balance(&treasury)
+            + token_client.balance(&contract_id),
+        funded
+    );
+    assert_eq!(token_client.balance(&contract_id), instructor_amount);
+    assert_eq!(
+        client.get_instructor_earnings(&instructor, &token_id),
+        token_client.balance(&contract_id)
+    );
+
+    // The instructor is paid out of the course contract directly.
+    client.withdraw_earnings(&instructor, &token_id, &0i128);
+    assert_eq!(token_client.balance(&instructor), instructor_amount);
+    assert_eq!(token_client.balance(&contract_id), 0);
+}
+
+// ============================================================
 // TOKEN ASSUMPTIONS & EARNINGS RECONCILIATION  (#138)
 // ============================================================
 
@@ -14529,6 +14781,61 @@ fn test_issue248_categories_too_many() {
         &BytesN::from_array(&env, &[11u8; 32]),
         &cats,
     );
+}
+
+#[test]
+fn test_issue367_get_course_returns_registered_categories() {
+    let (env, contract_id, token_id, instructor, _sec_admin, _treasury, _admin) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let mut cats = soroban_sdk::Vec::new(&env);
+    cats.push_back(String::from_str(&env, "programming"));
+    cats.push_back(String::from_str(&env, "blockchain"));
+
+    let course_id = String::from_str(&env, "CAT367");
+    client.register_course(
+        &instructor,
+        &course_id,
+        &100_000_000,
+        &token_id,
+        &0u32,
+        &None,
+        &BytesN::from_array(&env, &[37u8; 32]),
+        &cats,
+    );
+
+    let course = client.get_course(&course_id).unwrap();
+    assert_eq!(course.categories.len(), 2);
+    assert_eq!(
+        course.categories.get(0).unwrap(),
+        String::from_str(&env, "programming")
+    );
+    assert_eq!(
+        course.categories.get(1).unwrap(),
+        String::from_str(&env, "blockchain")
+    );
+}
+
+#[test]
+fn test_issue367_get_course_empty_categories() {
+    let (env, contract_id, token_id, instructor, _sec_admin, _treasury, _admin) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let cats = soroban_sdk::Vec::new(&env);
+    let course_id = String::from_str(&env, "CAT367EMPTY");
+    client.register_course(
+        &instructor,
+        &course_id,
+        &100_000_000,
+        &token_id,
+        &0u32,
+        &None,
+        &BytesN::from_array(&env, &[38u8; 32]),
+        &cats,
+    );
+
+    let course = client.get_course(&course_id).unwrap();
+    assert_eq!(course.categories.len(), 0);
 }
 
 #[test]
