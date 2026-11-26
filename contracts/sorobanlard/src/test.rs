@@ -102,6 +102,21 @@ fn get_enrollment_ref(
     enrollment.enrollment_ref
 }
 
+/// Count events published by `contract_id` whose first topic is `symbol_name`.
+fn count_events_with_symbol(env: &Env, contract_id: &Address, symbol_name: &str) -> u32 {
+    let mut count = 0u32;
+    for (contract, topics, _data) in env.events().all().iter() {
+        if contract != contract_id {
+            continue;
+        }
+        let sym: Symbol = topics.get(0).unwrap().try_into_val(env).unwrap();
+        if sym == Symbol::new(env, symbol_name) {
+            count += 1;
+        }
+    }
+    count
+}
+
 // ============================================================
 // INIT TESTS
 // ============================================================
@@ -1079,6 +1094,106 @@ fn test_enrollment_receipt_event_emitted_with_payment_breakdown() {
 }
 
 #[test]
+fn test_enroll_emits_student_enrolled_event_with_correct_fields() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    let price: i128 = 500_000_000;
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-ENROLL-EVENT-FIELDS",
+        price,
+    );
+
+    let course_id = String::from_str(&env, "COURSE-ENROLL-EVENT-FIELDS");
+    let ledger_before = env.ledger().sequence();
+
+    client.enroll(&student, &course_id);
+
+    // Verify the student_enrolled event carries the correct course_id,
+    // student address and amount paid.
+    let mut enrollment_events = 0u32;
+    for (contract, topics, data) in env.events().all().iter() {
+        if contract != contract_id {
+            continue;
+        }
+        let sym: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        if sym != Symbol::new(&env, "student_enrolled") {
+            continue;
+        }
+
+        enrollment_events += 1;
+
+        // Topic 1 is the course_id
+        let topic_course_id: String = topics.get(1).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(topic_course_id, course_id);
+
+        // Payload: (student, course_id, amount_paid, platform_fee, instructor_fee, ledger_seq)
+        let (
+            event_student,
+            event_course_id,
+            event_amount,
+            _event_platform_fee,
+            _event_instructor_fee,
+            event_ledger,
+        ): (Address, String, i128, i128, i128, u32) = data.try_into_val(&env).unwrap();
+
+        assert_eq!(event_student, student);
+        assert_eq!(event_course_id, course_id);
+        assert_eq!(event_amount, price); // amount paid
+        assert!(event_ledger >= ledger_before);
+    }
+    assert_eq!(enrollment_events, 1);
+}
+
+#[test]
+fn test_enroll_when_already_enrolled_emits_no_event() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-ENROLL-NO-EVENT",
+        500_000_000,
+    );
+
+    let course_id = String::from_str(&env, "COURSE-ENROLL-NO-EVENT");
+
+    // First enroll succeeds and emits one student_enrolled event.
+    client.enroll(&student, &course_id);
+    assert_eq!(
+        count_events_with_symbol(&env, &contract_id, "student_enrolled"),
+        1
+    );
+
+    // Second enroll on the same course panics ("already enrolled in this
+    // course") and must not emit an additional student_enrolled event.
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.enroll(&student, &course_id);
+    }));
+    assert!(res.is_err(), "re-enroll must panic");
+
+    assert_eq!(
+        count_events_with_symbol(&env, &contract_id, "student_enrolled"),
+        1
+    );
+}
+
+#[test]
 #[should_panic(expected = "course is not available for enrollment")]
 fn test_enroll_pending_course() {
     let (env, contract_id, token_id, _admin, sec_admin, _treasury, instructor) = setup();
@@ -1758,6 +1873,143 @@ fn test_certificate_issued_event_contains_full_issuance_details() {
 }
 
 #[test]
+fn test_issue_certificate_emits_certificate_issued_event_with_correct_fields() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    let course_id = String::from_str(&env, "COURSE-CERT-ISSUE-EVENT-001");
+    let certificate_id = String::from_str(&env, "CERT-ISSUE-EVENT-001");
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-CERT-ISSUE-EVENT-001",
+        500_000_000,
+    );
+
+    client.enroll(&student, &course_id);
+    client.mark_completed(
+        &admin,
+        &student,
+        &course_id,
+        &Some(String::from_str(&env, "completion-proof")),
+    );
+
+    let ledger_before = env.ledger().sequence();
+    client.issue_certificate(
+        &admin,
+        &student,
+        &course_id,
+        &certificate_id,
+        &String::from_str(&env, "Issue Event Course"),
+        &get_enrollment_ref(&env, &client, &student, "COURSE-CERT-ISSUE-EVENT-001"),
+        &None,
+        &None,
+    );
+
+    let mut issuance_events = 0u32;
+    for (contract, topics, data) in env.events().all().iter() {
+        if contract != contract_id {
+            continue;
+        }
+        let sym: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        if sym != Symbol::new(&env, "certificate_issued") {
+            continue;
+        }
+        issuance_events += 1;
+        assert_eq!(topics.len(), 2);
+
+        // Topic 1 is the certificate_id
+        let topic_cert_id: String = topics.get(1).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(topic_cert_id, certificate_id);
+
+        // Payload: (student, course_id, admin, issued_at_ledger)
+        let (
+            event_student,
+            event_course_id,
+            event_admin,
+            event_ledger,
+        ): (Address, String, Address, u32) = data.try_into_val(&env).unwrap();
+
+        assert_eq!(event_student, student);
+        assert_eq!(event_course_id, course_id);
+        assert_eq!(event_admin, admin);
+        assert!(event_ledger >= ledger_before);
+    }
+    assert_eq!(issuance_events, 1);
+}
+
+#[test]
+fn test_issue_certificate_reissue_does_not_emit_duplicate_event() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    let course_id = String::from_str(&env, "COURSE-CERT-REISSUE-EVENT");
+    let certificate_id = String::from_str(&env, "CERT-REISSUE-EVENT-001");
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-CERT-REISSUE-EVENT",
+        500_000_000,
+    );
+
+    client.enroll(&student, &course_id);
+    client.mark_completed(
+        &admin,
+        &student,
+        &course_id,
+        &Some(String::from_str(&env, "completion-proof")),
+    );
+
+    client.issue_certificate(
+        &admin,
+        &student,
+        &course_id,
+        &certificate_id,
+        &String::from_str(&env, "Reissue Event Course"),
+        &get_enrollment_ref(&env, &client, &student, "COURSE-CERT-REISSUE-EVENT"),
+        &None,
+        &None,
+    );
+    assert_eq!(
+        count_events_with_symbol(&env, &contract_id, "certificate_issued"),
+        1
+    );
+
+    // Re-issuance attempt panics ("certificate already issued for this
+    // enrollment") and must not emit a second certificate_issued event.
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.issue_certificate(
+            &admin,
+            &student,
+            &course_id,
+            &certificate_id,
+            &String::from_str(&env, "Reissue Event Course"),
+            &get_enrollment_ref(&env, &client, &student, "COURSE-CERT-REISSUE-EVENT"),
+            &None,
+            &None,
+        );
+    }));
+    assert!(res.is_err(), "re-issuance must panic");
+
+    assert_eq!(
+        count_events_with_symbol(&env, &contract_id, "certificate_issued"),
+        1
+    );
+}
+
+#[test]
 #[should_panic(expected = "student has not completed this course")]
 fn test_certificate_requires_completion() {
     let (env, contract_id, token_id, admin, sec_admin, _treasury, instructor) = setup();
@@ -2156,6 +2408,146 @@ fn test_event_certificate_revoked() {
 
     // Ensure exactly one certificate_revoked event was emitted
     assert_eq!(revoke_events, 1);
+}
+
+#[test]
+fn test_revoke_certificate_emits_certificate_revoked_event_with_correct_id() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    let course_id = String::from_str(&env, "COURSE-REVOKE-EVENT-001");
+    let cert_id = String::from_str(&env, "CERT-REVOKE-EVENT-001");
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-REVOKE-EVENT-001",
+        300_000_000,
+    );
+
+    client.enroll(&student, &course_id);
+    client.mark_completed(
+        &admin,
+        &student,
+        &course_id,
+        &Some(String::from_str(&env, "proof")),
+    );
+    client.issue_certificate(
+        &admin,
+        &student,
+        &course_id,
+        &cert_id,
+        &String::from_str(&env, "Title"),
+        &get_enrollment_ref(&env, &client, &student, "COURSE-REVOKE-EVENT-001"),
+        &None,
+        &None,
+    );
+
+    let ledger_before = env.ledger().sequence();
+    let reason = String::from_str(&env, "ACADEMIC_DISHONESTY");
+    client.revoke_certificate(&admin, &cert_id, &reason);
+
+    let mut revoke_events = 0u32;
+    for (contract, topics, data) in env.events().all().iter() {
+        if contract != contract_id {
+            continue;
+        }
+        let sym: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        if sym != Symbol::new(&env, "certificate_revoked") {
+            continue;
+        }
+        revoke_events += 1;
+
+        // Topic 1 is the certificate_id
+        let topic_cert_id: String = topics.get(1).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(topic_cert_id, cert_id);
+
+        // Payload: (admin, certificate_id, student, course_id, reason, ledger_sequence, deadline)
+        let (
+            event_admin,
+            event_certificate_id,
+            event_student,
+            event_course_id,
+            event_reason,
+            event_ledger,
+            _event_deadline,
+        ): (Address, String, Address, String, String, u32, u32) =
+            data.try_into_val(&env).unwrap();
+
+        assert_eq!(event_admin, admin);
+        assert_eq!(event_certificate_id, cert_id);
+        assert_eq!(event_student, student);
+        assert_eq!(event_course_id, course_id);
+        assert_eq!(event_reason, reason);
+        assert!(event_ledger >= ledger_before);
+    }
+    assert_eq!(revoke_events, 1);
+}
+
+#[test]
+fn test_double_revoke_does_not_emit_second_event() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    let course_id = String::from_str(&env, "COURSE-REVOKE-DBL-001");
+    let cert_id = String::from_str(&env, "CERT-REVOKE-DBL-001");
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-REVOKE-DBL-001",
+        300_000_000,
+    );
+
+    client.enroll(&student, &course_id);
+    client.mark_completed(
+        &admin,
+        &student,
+        &course_id,
+        &Some(String::from_str(&env, "proof")),
+    );
+    client.issue_certificate(
+        &admin,
+        &student,
+        &course_id,
+        &cert_id,
+        &String::from_str(&env, "Title"),
+        &get_enrollment_ref(&env, &client, &student, "COURSE-REVOKE-DBL-001"),
+        &None,
+        &None,
+    );
+
+    let reason = String::from_str(&env, "ACADEMIC_DISHONESTY");
+    client.revoke_certificate(&admin, &cert_id, &reason);
+    assert_eq!(
+        count_events_with_symbol(&env, &contract_id, "certificate_revoked"),
+        1
+    );
+
+    // Revoking an already-revoked certificate panics ("certificate is
+    // already revoked") and must not emit a second certificate_revoked event.
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.revoke_certificate(&admin, &cert_id, &reason);
+    }));
+    assert!(
+        res.is_err(),
+        "revoking an already-revoked certificate must panic"
+    );
+
+    assert_eq!(
+        count_events_with_symbol(&env, &contract_id, "certificate_revoked"),
+        1
+    );
 }
 
 #[test]
@@ -9473,6 +9865,135 @@ fn test_upgrade_contract_executes_after_timelock_elapses() {
     });
 
     client.upgrade_contract(&admin, &sec_admin);
+}
+
+#[test]
+fn test_upgrade_executed_event_first_upgrade_emits_none_old_wasm_hash() {
+    let (env, contract_id, _token_id, admin, sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let new_wasm_hash = BytesN::from_array(&env, &[0xC3u8; 32]);
+    client.propose_upgrade(&admin, &sec_admin, &new_wasm_hash);
+
+    let timelock = client.get_upgrade_timelock();
+    env.ledger().with_mut(|l| {
+        l.sequence_number += timelock + 1;
+    });
+    let ledger_before = env.ledger().sequence();
+
+    // Native tests cannot upload the proposed Wasm, so `upgrade_contract`
+    // panics at the host Wasm-swap call. The `upgrade_executed` event is
+    // published before that call, so it is observable after catching the
+    // panic.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.upgrade_contract(&admin, &sec_admin);
+    }));
+
+    let mut upgrade_events = 0u32;
+    for (contract, topics, data) in env.events().all().iter() {
+        if contract != contract_id {
+            continue;
+        }
+        let sym: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        if sym != Symbol::new(&env, "upgrade_executed") {
+            continue;
+        }
+        upgrade_events += 1;
+        assert_eq!(topics.len(), 2);
+
+        // Topic 1 is the new Wasm hash
+        let topic_new_hash: BytesN<32> = topics.get(1).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(topic_new_hash, new_wasm_hash);
+
+        // Payload: (old_wasm_hash, new_wasm_hash, admin1, admin2, ledger_seq)
+        let (
+            old_wasm_hash,
+            event_new_hash,
+            event_admin1,
+            event_admin2,
+            event_ledger,
+        ): (Option<BytesN<32>>, BytesN<32>, Address, Address, u32) =
+            data.try_into_val(&env).unwrap();
+
+        // The first upgrade of a deployment has no previous Wasm hash.
+        assert!(old_wasm_hash.is_none());
+        assert_eq!(event_new_hash, new_wasm_hash);
+        assert_eq!(event_admin1, admin);
+        assert_eq!(event_admin2, sec_admin);
+        assert!(event_ledger >= ledger_before);
+    }
+    assert_eq!(upgrade_events, 1);
+}
+
+#[test]
+fn test_upgrade_executed_event_subsequent_upgrade_has_previous_hash_as_old() {
+    let (env, contract_id, _token_id, admin, sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let first_hash = BytesN::from_array(&env, &[0xD1u8; 32]);
+    client.propose_upgrade(&admin, &sec_admin, &first_hash);
+    let timelock = client.get_upgrade_timelock();
+    env.ledger().with_mut(|l| {
+        l.sequence_number += timelock + 1;
+    });
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.upgrade_contract(&admin, &sec_admin);
+    }));
+
+    // Second upgrade: the previously-executed hash must now appear as
+    // old_wasm_hash in the new event.
+    let second_hash = BytesN::from_array(&env, &[0xD2u8; 32]);
+    client.propose_upgrade(&admin, &sec_admin, &second_hash);
+    env.ledger().with_mut(|l| {
+        l.sequence_number += timelock + 1;
+    });
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.upgrade_contract(&admin, &sec_admin);
+    }));
+
+    let mut upgrade_events = 0u32;
+    let mut saw_first_upgrade = false;
+    let mut saw_second_upgrade = false;
+    for (contract, topics, data) in env.events().all().iter() {
+        if contract != contract_id {
+            continue;
+        }
+        let sym: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        if sym != Symbol::new(&env, "upgrade_executed") {
+            continue;
+        }
+        upgrade_events += 1;
+
+        // Payload: (old_wasm_hash, new_wasm_hash, admin1, admin2, ledger_seq)
+        let (
+            old_wasm_hash,
+            event_new_hash,
+            event_admin1,
+            event_admin2,
+            _event_ledger,
+        ): (Option<BytesN<32>>, BytesN<32>, Address, Address, u32) =
+            data.try_into_val(&env).unwrap();
+
+        if event_new_hash == first_hash {
+            assert!(
+                old_wasm_hash.is_none(),
+                "first upgrade must have no old hash"
+            );
+            saw_first_upgrade = true;
+        } else if event_new_hash == second_hash {
+            assert_eq!(
+                old_wasm_hash,
+                Some(first_hash.clone()),
+                "subsequent upgrade must record the previous hash as old_wasm_hash"
+            );
+            assert_eq!(event_admin1, admin);
+            assert_eq!(event_admin2, sec_admin);
+            saw_second_upgrade = true;
+        }
+    }
+    assert_eq!(upgrade_events, 2);
+    assert!(saw_first_upgrade);
+    assert!(saw_second_upgrade);
 }
 
 #[test]
