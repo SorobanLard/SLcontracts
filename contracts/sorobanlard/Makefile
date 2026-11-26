@@ -24,10 +24,13 @@
 
 NETWORK       = testnet
 CONTRACT_NAME = sorobanlard
-WASM_PATH     = target/wasm32v1-none/release/$(CONTRACT_NAME).wasm
-WASM_OPT      = target/wasm32v1-none/release/$(CONTRACT_NAME).optimized.wasm
+# `stellar contract build` writes to the Cargo workspace target directory at
+# the repository root, not to this crate's directory.
+REPO_ROOT    := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))../..)
+WASM_PATH     = $(REPO_ROOT)/target/wasm32v1-none/release/$(CONTRACT_NAME).wasm
+WASM_OPT      = $(REPO_ROOT)/target/wasm32v1-none/release/$(CONTRACT_NAME).optimized.wasm
 
-.PHONY: test build optimize deploy-testnet clean fmt check
+.PHONY: test build optimize deploy-testnet clean fmt check audit
 
 # Run the contract's Rust test suite via `cargo test`.
 test:
@@ -67,3 +70,10 @@ check:
 # Remove build artifacts with `cargo clean`.
 clean:
 	cargo clean
+
+# Audit Cargo.lock against the RustSec advisory database with `cargo audit`.
+# Runs from the repository root so the workspace Cargo.lock and
+# .cargo/audit.toml (ignored-advisory policy) are used. Exits non-zero on any
+# advisory not listed in .cargo/audit.toml. Requires `cargo install cargo-audit`.
+audit:
+	cd $(REPO_ROOT) && cargo audit

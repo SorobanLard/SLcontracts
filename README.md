@@ -394,6 +394,7 @@ sorobanlard-contract/
 ├── scripts/
 │   ├── check_invariants.sh            ← Invariant documentation / test coverage check
 │   ├── check_readme_api.py            ← README vs lib.rs signature check
+│   ├── e2e-wasm.sh                    ← Build, deploy and drive the compiled Wasm
 │   └── smoke-test-testnet.sh          ← Post-deployment testnet smoke test
 └── contracts/
     └── sorobanlard/
@@ -448,6 +449,22 @@ cargo test
 cargo test -- --nocapture          # with output
 cargo test test_full_lifecycle     # single test
 ```
+
+### End to end, against the compiled Wasm
+
+`cargo test` runs against the Soroban test host, which never builds the
+contract, never deploys it and never sees the XDR a real invocation produces.
+`scripts/e2e-wasm.sh` starts from source instead: it builds `sorobanlard.wasm`,
+deploys it, runs `init`, and drives register → approve → enroll →
+mark_completed → issue_certificate → verify_certificate through
+`stellar contract invoke` against that deployment.
+
+```bash
+stellar container start local      # once, for NETWORK=local
+scripts/e2e-wasm.sh                # NETWORK=testnet also works
+```
+
+It needs the `stellar` CLI and a reachable network, so it is not part of CI.
 
 Expected:
 ```
