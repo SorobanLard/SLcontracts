@@ -486,6 +486,83 @@ fn test_enroll_success_with_payment_split() {
 }
 
 #[test]
+fn test_enroll_zero_platform_fee_routes_full_price_to_instructor() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+
+    // Zero platform fee for this token
+    client.set_fee_config(&admin, &token_id, &0u32);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    let price: i128 = 1_000_000_000;
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-FASHION-ZERO-FEE",
+        price,
+    );
+
+    client.enroll(&student, &String::from_str(&env, "COURSE-FASHION-ZERO-FEE"));
+
+    // Instructor receives the full price; nothing is withheld as platform fee
+    assert_eq!(client.get_instructor_earnings(&instructor, &token_id), price);
+
+    let enrollment = client
+        .get_enrollment(
+            &student,
+            &student,
+            &String::from_str(&env, "COURSE-FASHION-ZERO-FEE"),
+        )
+        .unwrap();
+    assert_eq!(enrollment.platform_amount, 0);
+    assert_eq!(enrollment.instructor_amount, price);
+
+    // Instructor can withdraw the full price
+    client.withdraw_earnings(&instructor, &token_id, &0i128);
+    assert_eq!(token_client.balance(&instructor), price);
+    assert_eq!(client.get_instructor_earnings(&instructor, &token_id), 0);
+}
+
+#[test]
+fn test_enroll_zero_platform_fee_treasury_receives_zero() {
+    let (env, contract_id, token_id, admin, _sec_admin, treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+
+    client.set_fee_config(&admin, &token_id, &0u32);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    let price: i128 = 1_000_000_000;
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-FASHION-ZERO-FEE-TREASURY",
+        price,
+    );
+
+    let treasury_balance_before = token_client.balance(&treasury);
+
+    client.enroll(
+        &student,
+        &String::from_str(&env, "COURSE-FASHION-ZERO-FEE-TREASURY"),
+    );
+
+    assert_eq!(token_client.balance(&treasury), treasury_balance_before);
+    assert_eq!(token_client.balance(&treasury), 0);
+}
+
+#[test]
 #[should_panic(expected = "enrollment has not started for this course")]
 fn test_enroll_rejects_before_enrollment_start_ledger() {
     let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
@@ -1043,6 +1120,70 @@ fn test_is_enrolled_check() {
     assert!(!client.is_enrolled(&student, &course_id));
 
     client.enroll(&student, &course_id);
+    assert!(client.is_enrolled(&student, &course_id));
+}
+
+#[test]
+fn test_is_enrolled_admin_can_query_any_student() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student_a = Address::generate(&env);
+    let student_b = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student_a, &100_000_000_000);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student_b, &100_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-ADMIN-QUERY",
+        300_000_000,
+    );
+
+    let course_id = String::from_str(&env, "COURSE-ADMIN-QUERY");
+    let other_course_id = String::from_str(&env, "COURSE-ADMIN-QUERY-OTHER");
+
+    // Admin can query any student, enrolled or not, without authorization.
+    assert!(!client.is_enrolled(&student_a, &course_id));
+    assert!(!client.is_enrolled(&student_b, &course_id));
+
+    client.enroll(&student_a, &course_id);
+
+    assert!(client.is_enrolled(&student_a, &course_id));
+    assert!(!client.is_enrolled(&student_b, &course_id));
+    assert!(!client.is_enrolled(&student_a, &other_course_id));
+}
+
+#[test]
+fn test_is_enrolled_third_party_query_is_read_only() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    let third_party = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-THIRD-PARTY",
+        300_000_000,
+    );
+
+    let course_id = String::from_str(&env, "COURSE-THIRD-PARTY");
+    client.enroll(&student, &course_id);
+
+    // is_enrolled is a read-only view: it requires no auth, so a third party
+    // who is neither the student nor an admin gets the same answer and cannot
+    // mutate enrollment state.
+    assert!(client.is_enrolled(&student, &course_id));
+    assert!(!client.is_enrolled(&third_party, &course_id));
     assert!(client.is_enrolled(&student, &course_id));
 }
 
@@ -1801,6 +1942,67 @@ fn test_pause_and_unpause_course() {
     client.unpause_course(&admin, &course_id);
     let course = client.get_course(&course_id).unwrap();
     assert_eq!(course.status, CourseStatus::Active);
+}
+
+/// Enrolling in a Paused course must panic.
+#[test]
+#[should_panic(expected = "course is not available for enrollment")]
+fn test_enroll_paused_course_panics() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    let course_id = String::from_str(&env, "COURSE-PAUSED-ENROLL");
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-PAUSED-ENROLL",
+        100_000_000,
+    );
+
+    client.pause_course(&instructor, &course_id);
+    assert_eq!(
+        client.get_course(&course_id).unwrap().status,
+        CourseStatus::Paused
+    );
+
+    client.enroll(&student, &course_id);
+}
+
+/// unpause_course restores enrollment acceptance.
+#[test]
+fn test_unpause_course_restores_enrollment() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    let course_id = String::from_str(&env, "COURSE-UNPAUSE-ENROLL");
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-UNPAUSE-ENROLL",
+        100_000_000,
+    );
+
+    client.pause_course(&instructor, &course_id);
+    client.unpause_course(&admin, &course_id);
+    assert_eq!(
+        client.get_course(&course_id).unwrap().status,
+        CourseStatus::Active
+    );
+
+    client.enroll(&student, &course_id);
+    assert!(client
+        .get_enrollment(&student, &student, &course_id)
+        .is_some());
 }
 
 /// Double-pause must be rejected (Active-status precondition)
@@ -9346,6 +9548,152 @@ fn test_issue_146_configurable_challenge_period() {
     let deadline = cert.revocation_deadline.unwrap();
     assert_eq!(deadline, ledger_before + 5);
 }
+
+/// Issue a certificate for `student` on a freshly registered course and
+/// return the certificate id.
+fn issue_test_certificate(
+    env: &Env,
+    client: &SorobanLardContractClient,
+    token_id: &Address,
+    admin: &Address,
+    instructor: &Address,
+    course: &str,
+    cert: &str,
+) -> (Address, String) {
+    let student = Address::generate(env);
+    token::StellarAssetClient::new(env, token_id).mint(&student, &100_000_000_000);
+
+    register_and_approve_course(env, client, token_id, admin, instructor, course, 500_000_000);
+
+    let course_id = String::from_str(env, course);
+    let cert_id = String::from_str(env, cert);
+
+    client.enroll(&student, &course_id);
+    client.mark_completed(admin, &student, &course_id, &None);
+    client.issue_certificate(
+        admin,
+        &student,
+        &course_id,
+        &cert_id,
+        &String::from_str(env, "Course"),
+        &get_enrollment_ref(env, client, &student, course),
+        &None,
+        &None,
+    );
+
+    (student, cert_id)
+}
+
+#[test]
+fn test_issue_383_update_challenge_period_shorter_window_challenge_succeeds() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let (student, cert_id) = issue_test_certificate(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-383-SHORT-OK",
+        "CERT-383-SHORT-OK",
+    );
+
+    // Shrink the challenge window from 17_280 to 10 ledgers.
+    client.update_revocation_challenge_period(&admin, &10u32);
+    assert_eq!(client.get_revocation_challenge_period(), 10);
+
+    let revoke_ledger = env.ledger().sequence();
+    client.revoke_certificate(&admin, &cert_id, &String::from_str(&env, "TEST"));
+
+    let cert = client.get_certificate(&admin, &cert_id);
+    assert_eq!(cert.revocation_deadline, Some(revoke_ledger + 10));
+
+    // A challenge inside the new, shorter window still succeeds.
+    env.ledger().with_mut(|l| {
+        l.sequence_number = revoke_ledger + 9;
+    });
+    client.challenge_revocation(&student, &cert_id);
+
+    let cert = client.get_certificate(&admin, &cert_id);
+    assert!(!cert.revoked);
+    assert!(cert.revocation_deadline.is_none());
+    assert!(client.verify_certificate(&cert_id));
+}
+
+#[test]
+#[should_panic(expected = "revocation challenge period has expired")]
+fn test_issue_383_update_challenge_period_shorter_window_challenge_rejected() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let (student, cert_id) = issue_test_certificate(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-383-SHORT-LATE",
+        "CERT-383-SHORT-LATE",
+    );
+
+    client.update_revocation_challenge_period(&admin, &10u32);
+
+    let revoke_ledger = env.ledger().sequence();
+    client.revoke_certificate(&admin, &cert_id, &String::from_str(&env, "TEST"));
+
+    // Ledger 15 is inside the old 17_280 window but outside the new 10-ledger
+    // window, so the challenge must be rejected.
+    env.ledger().with_mut(|l| {
+        l.sequence_number = revoke_ledger + 15;
+    });
+    client.challenge_revocation(&student, &cert_id);
+}
+
+#[test]
+fn test_issue_383_pre_existing_certificate_uses_period_at_revocation_time() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    // Certificate is issued while the default (17_280) period is active.
+    let (student, cert_id) = issue_test_certificate(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-383-PREEXIST",
+        "CERT-383-PREEXIST",
+    );
+
+    // Revoke while the default period is still active.
+    let revoke_ledger = env.ledger().sequence();
+    client.revoke_certificate(&admin, &cert_id, &String::from_str(&env, "TEST"));
+
+    let cert = client.get_certificate(&admin, &cert_id);
+    let deadline = cert.revocation_deadline.unwrap();
+    assert_eq!(deadline, revoke_ledger + 17_280);
+
+    // Shrinking the period afterwards must not move the existing deadline.
+    client.update_revocation_challenge_period(&admin, &10u32);
+    assert_eq!(client.get_revocation_challenge_period(), 10);
+    assert_eq!(
+        client
+            .get_certificate(&admin, &cert_id)
+            .revocation_deadline,
+        Some(deadline)
+    );
+
+    // A challenge well past the new 10-ledger window but still inside the
+    // period active at revocation time succeeds.
+    env.ledger().with_mut(|l| {
+        l.sequence_number = revoke_ledger + 100;
+    });
+    client.challenge_revocation(&student, &cert_id);
+    assert!(!client.get_certificate(&admin, &cert_id).revoked);
+    assert!(client.verify_certificate(&cert_id));
+}
+
 // ============================================================
 // ENROLLMENT REJECTION EVENT TESTS
 // ============================================================
