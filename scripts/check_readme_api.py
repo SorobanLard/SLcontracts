@@ -10,9 +10,14 @@
 
 The `env` parameter is not counted, because callers never pass it.
 
-Usage: python3 scripts/check_readme_api.py
+With --strict, a public function missing from README.md, or a backticked
+`name(...)` call in README.md with no matching function in lib.rs, is an
+error instead of being ignored.
+
+Usage: python3 scripts/check_readme_api.py [--strict] [--lib-rs PATH] [--readme PATH]
 """
 
+import argparse
 import re
 import sys
 from pathlib import Path
@@ -93,9 +98,20 @@ def mentions(readme, name):
         yield arg_count, readme.count("\n", 0, match.start()) + 1
 
 
-def main():
-    functions = public_functions(LIB_RS.read_text(encoding="utf-8"))
-    readme = README.read_text(encoding="utf-8")
+README_CALL_RE = re.compile(r"`([a-z_][a-z0-9_]*)\(")
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--lib-rs", type=Path, default=LIB_RS)
+    parser.add_argument("--readme", type=Path, default=README)
+    parser.add_argument("--strict", action="store_true",
+                        help="fail on undocumented functions and on README "
+                             "functions that do not exist in lib.rs")
+    args = parser.parse_args(argv)
+
+    functions = public_functions(args.lib_rs.read_text(encoding="utf-8"))
+    readme = args.readme.read_text(encoding="utf-8")
 
     errors = []
     undocumented = []
@@ -111,6 +127,20 @@ def main():
                     f"README.md:{line}: `{name}` is documented with {arg_count} "
                     f"argument(s) but lib.rs takes {expected}"
                 )
+
+    if args.strict:
+        for name in undocumented:
+            errors.append(f"`{name}` is a public function in lib.rs but is not "
+                          f"mentioned in README.md")
+        unknown = {}
+        for match in README_CALL_RE.finditer(readme):
+            name = match.group(1)
+            if name not in functions:
+                unknown.setdefault(name, readme.count("\n", 0, match.start()) + 1)
+        for name, line in sorted(unknown.items()):
+            errors.append(f"README.md:{line}: `{name}` is documented but is not "
+                          f"a public function in lib.rs")
+        undocumented = []
 
     for message in errors:
         print(f"::error file=README.md::{message}")

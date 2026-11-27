@@ -177,8 +177,36 @@ jobs:
         run: cargo install cargo-audit --locked
       # Reads Cargo.lock and .cargo/audit.toml. Policy for advisories with no fix
       # is documented in CONTRIBUTING.md.
+      # Fails on any advisory not ignored (with rationale) in .cargo/audit.toml,
+      # so the job passes only when the current dependency tree audits clean.
       - name: Audit Cargo.lock against RustSec
-        run: cargo audit
+        run: make -C contracts/sorobanlard audit
+
+  script-tests:
+    name: Doc checker script tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test check_readme_api.py and check_invariants.sh
+        run: python3 -m unittest discover -s scripts/tests -v
+
+  wasm-artifacts:
+    name: Makefile build/optimize WASM tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: wasm32v1-none
+      - uses: Swatinem/rust-cache@v2
+      - name: Install stellar CLI
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev libudev-dev pkg-config
+          cargo install --locked stellar-cli
+      - name: Test make build / make optimize outputs load in the test host
+        run: ./scripts/test_wasm_build.sh
 
   readme-api:
     name: README API Check

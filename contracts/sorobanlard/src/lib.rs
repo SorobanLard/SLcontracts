@@ -4652,6 +4652,16 @@ impl SorobanLardContract {
         );
     }
 
+    /// Update the revocation challenge period (in ledger sequences).
+    ///
+    /// Alias of `set_revocation_challenge_period` kept for callers that use
+    /// the `update_*` naming convention. The new period applies to every
+    /// revocation performed after this call; certificates already revoked
+    /// keep the deadline computed when they were revoked.
+    pub fn update_revocation_challenge_period(env: Env, admin: Address, period: u32) {
+        Self::set_revocation_challenge_period(env, admin, period);
+    }
+
     /// Get the revocation challenge period (in ledger sequences)
     pub fn get_revocation_challenge_period(env: Env) -> u32 {
         env.storage()
