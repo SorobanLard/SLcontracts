@@ -5362,10 +5362,16 @@ impl SorobanLardContract {
     /// `bulk_revoke_course_certificates()`. Returns an empty list for a course
     /// with no issued certificates.
     pub fn get_course_certificates(env: Env, course_id: String) -> Vec<String> {
-        env.storage()
+        let key = DataKey::CourseCertificates(course_id);
+        let result: Vec<String> = env
+            .storage()
             .persistent()
-            .get(&DataKey::CourseCertificates(course_id))
-            .unwrap_or_else(|| Vec::new(&env))
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        if env.storage().persistent().has(&key) {
+            Self::extend_persistent_ttl(&env, &key);
+        }
+        result
     }
 
     /// Check whether a student is enrolled in a course
